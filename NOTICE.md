@@ -3,6 +3,11 @@
 openGym — Copyright (C) 2026 Duarte Santos.
 openGym's own code is licensed under the **GNU AGPL v3.0** (see [LICENSE](LICENSE)).
 
+This is a modified version: changes by Omar Valenzuela, 2026-11-19, on top of
+[alexpcosta/opengym](https://github.com/alexpcosta/opengym) at commit `678bf5b`
+(multiple passkeys per account, admin-issued recovery codes, optional guest mode and
+security hardening). The modifications are released under the same GNU AGPL v3.0.
+
 ## App store exception
 
 As an additional permission under section 7 of the AGPL v3.0, the copyright holder permits

@@ -34,6 +34,8 @@ This repository is a fork of [alexpcosta/opengym](https://github.com/alexpcosta/
 [DuarteSantos8/openGym](https://github.com/DuarteSantos8/openGym) by Duarte Santos. It stays
 under the same license, **GNU AGPL v3.0** ([LICENSE](LICENSE), [NOTICE.md](NOTICE.md)).
 
+Modified by Omar Valenzuela on 2026-11-19 (see the commits after `678bf5b` for every change).
+
 What it adds on top:
 
 - **Passkeys on several devices.** Settings → Passkeys lists the profile's passkeys (device,
