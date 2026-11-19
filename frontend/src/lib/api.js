@@ -53,11 +53,22 @@ export async function passkeyRegister(name, code) {
 }
 // Another passkey on the signed-in profile. The browser's own dialog
 // offers "this device" or another one (a phone over QR, a security key), so this one call covers both.
-export async function passkeyAdd() {
-  const { cid, options } = await api('/api/passkeys/options', { method: 'POST', body: '{}' })
+// Adding or removing a passkey first needs a fresh assertion with a passkey
+// the profile already has. Returns a one-time grant for `purpose` ('add' | 'remove').
+export async function passkeyStepUp(purpose) {
+  const { cid, options } = await api('/api/passkeys/stepup/options', { method: 'POST', body: JSON.stringify({ purpose }) })
+  const cred = await navigator.credentials.get({ publicKey: toRequestOptions(options) })
+  const r = await api('/api/passkeys/stepup/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
+  return r.grant
+}
+export async function passkeyAdd(grant) {
+  const { cid, options } = await api('/api/passkeys/options', { method: 'POST', body: JSON.stringify({ grant }) })
   const cred = await navigator.credentials.create({ publicKey: toCreationOptions(options) })
   return api('/api/passkeys/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
 }
+export const passkeyList = () => api('/api/passkeys').then(r => r.passkeys)
+export const passkeyRemove = (id, grant) => api('/api/passkeys/remove', { method: 'POST', body: JSON.stringify({ id, grant }) })
+export const ackNotices = () => api('/api/notices/ack', { method: 'POST', body: '{}' })
 // Recovery with an admin-issued code, in two steps so that the passkey prompt (step 2) runs
 // straight from a tap — Safari only shows it inside a user gesture.
 export async function recoveryCheck(code) {

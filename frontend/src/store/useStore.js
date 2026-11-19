@@ -199,6 +199,8 @@ export const useStore = create((set, get) => {
       try {
         const me = await api('/api/me')
         get().setUser(me.user)
+        // Security notices for this session (passkey added/removed elsewhere, recovery).
+        if (me.notices?.length) import('../lib/notices.jsx').then(m => m.showNotices(me.notices)).catch(() => {})
         await get().pullState()
         // Re-stamp the reminder's timezone on every load — keeps it correct if you're travelling,
         // without needing to revisit Settings.

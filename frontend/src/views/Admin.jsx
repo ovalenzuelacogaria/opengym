@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
-import { api } from '../lib/api.js'
+import { api, passkeyStepUp } from '../lib/api.js'
 import { fmtDate, fmtNum, fmtVol, fmtDur } from '../lib/format.js'
 import { workoutVolume, setsDone } from '../lib/history.js'
 import { confirmSheet } from '../sheets.jsx'
@@ -74,9 +74,19 @@ function RecoveryCard({ user, passkeys, pending: initial }) {
   const [pending, setPending] = useState(initial)
   const [issued, setIssued] = useState(null)   // { code, exp } — only in memory, only now
   const when = ms => new Date(ms).toLocaleString(dateLocale(), { dateStyle: 'medium', timeStyle: 'short' })
-  const issue = () => api('/api/admin/recovery/new', { method: 'POST', body: JSON.stringify({ id: user.id }) })
-    .then(r => { setIssued({ code: r.code, exp: r.exp }); setPending({ exp: r.exp }) })
-    .catch(e => toast(e.status === 429 ? t('Too many attempts — wait a few minutes and try again.') : e.message))
+  // The server wants the admin's own passkey before it issues a code.
+  const issue = async () => {
+    try {
+      const grant = await passkeyStepUp('recovery-issue')
+      const r = await api('/api/admin/recovery/new', { method: 'POST', body: JSON.stringify({ id: user.id, grant }) })
+      setIssued({ code: r.code, exp: r.exp }); setPending({ exp: r.exp })
+    } catch (e) {
+      if (e.name === 'NotAllowedError' || e.name === 'AbortError') return
+      toast(e.status === 429 ? t('Too many attempts — wait a few minutes and try again.')
+        : e.status === 403 ? t('Confirm with one of your passkeys first — or that took too long. Start again.')
+        : e.message)
+    }
+  }
   const revoke = () => api('/api/admin/recovery/revoke', { method: 'POST', body: JSON.stringify({ id: user.id }) })
     .then(() => { setIssued(null); setPending(null); toast(t('Recovery code revoked')) })
     .catch(e => toast(e.message))
@@ -84,7 +94,9 @@ function RecoveryCard({ user, passkeys, pending: initial }) {
   return <>
     <h4 className="sec">{t('Access')}</h4>
     <div className="small muted" style={{ marginBottom: 8 }}>{t('Passkeys: {0}', passkeys ?? '—')}</div>
-    {issued ? <div className="card" style={{ textAlign: 'center' }}>
+    {/* The server refuses codes for admin accounts. */}
+    {user.admin ? <div className="dim small">{t('Admin accounts can’t be recovered with a code — only by editing the server data.')}</div>
+    : issued ? <div className="card" style={{ textAlign: 'center' }}>
       <div className="dim small">{t('Recovery code for {0}', user.name)}</div>
       <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: '1.15rem', fontWeight: 700, letterSpacing: '.06em', margin: '8px 0', userSelect: 'all', overflowWrap: 'anywhere' }}>{issued.code}</div>
       <div className="dim small">{t('Works once, until {0}. It will not be shown again.', when(issued.exp))}</div>
@@ -99,7 +111,7 @@ function RecoveryCard({ user, passkeys, pending: initial }) {
       <div className="row" style={{ gap: 8 }}>
         <Button size="sm" icon="key" onClick={() => confirmSheet({
           title: t('Recovery code for {0}?', user.name),
-          message: t('Whoever has the code can add a passkey to this profile, once, before it expires. Any earlier code stops working, and the profile is signed out on all devices when it is used.'),
+          message: t('Whoever has the code can add a passkey to this profile, once, before it expires. Any earlier code stops working. When it is used, the earlier passkeys of the profile are removed and it is signed out on all devices.'),
           confirmText: t('Generate'), onConfirm: issue
         })}>{pending ? t('New recovery code') : t('Generate recovery code')}</Button>
         {pending && <Button size="sm" variant="danger" onClick={revoke}>{t('Revoke')}</Button>}

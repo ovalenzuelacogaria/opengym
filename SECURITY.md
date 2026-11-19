@@ -116,22 +116,34 @@ Read this before hosting openGym for anyone other than yourself.
   was issued with, so changing the setting doesn't reach cookies that are already out. Deleting
   `./data/secret` and restarting still works as the instance-wide reset, and disabling an account
   still locks out one user completely.
-- **CSRF protection is `SameSite=Lax` and nothing else.** There are no CSRF tokens.
+- **Writes must be same-origin JSON.** Every request other than GET/HEAD needs
+  `Content-Type: application/json` (else 415) and an `Origin` header exactly equal to `ORIGIN`
+  (else 403, including when it is missing). `SameSite=Lax` alone let any page on a sibling
+  subdomain post a `text/plain` body with the user's cookie. No CSRF tokens. `ORIGIN` must match
+  what the browser sends (scheme, host, port); a trailing slash or path is stripped at boot, and a
+  value that is not an origin, or plain http on a host other than localhost, is reported in the log.
 - **User verification is preferred, not required.** Both handshakes pass
   `requireUserVerification: false` (`api/server.js:297`, `api/server.js:343`), so a passkey
   released without a biometric or PIN is still accepted. In practice: unlocked device ≈ account
   access.
-- **More passkeys and recovery go through a session or an admin.** Sign-up still creates a *new*
-  profile each time. A signed-in user can add passkeys to their own profile from Settings
-  (`POST /api/passkeys/*`, user verification required). Someone who lost every device gets back in
-  only with a one-time code an admin issues from the dashboard (`POST /api/admin/recovery/new`):
+- **More passkeys and recovery go through a passkey or an admin.** Sign-up still creates a *new*
+  profile each time. A signed-in user can add or remove passkeys in Settings → Passkeys, but only
+  after a fresh assertion (`STEPUP_MAX_AGE_S`, 5 min) with a passkey the profile already has: the
+  one-time grant it yields is bound to that session cookie, the session version, the user and the
+  purpose (`POST /api/passkeys/stepup/*`). A stolen cookie alone can neither plant a passkey nor
+  remove one. The last passkey can't be removed. Other sessions of the user get an in-app notice
+  of every add, removal and recovery at their next load. Someone who lost every device gets back in
+  only with a one-time code an admin issues from the dashboard (`POST /api/admin/recovery/new`,
+  which also needs the step-up with one of the admin's own passkeys; revoking a code does not):
   bound to one user, stored as an HMAC under `./data/secret`, compared in constant time, valid
   `RECOVERY_HOURS` (24 by default), revoked by the next one, and burned when the new passkey is
   verified, which also signs the profile out everywhere. The code is a bearer secret: whoever holds
-  it can add a passkey to that profile until it is used or expires — hand it over in person. Old
-  passkeys are not removed by a recovery. There is still no email or self-service reset.
-  Events (issued, used, refused, revoked, rate-limited, passkey added) go to `db.json` `authLog`
-  and the api log, without the code.
+  it can add a passkey to that profile until it is used or expires — hand it over in person. A
+  recovery removes every earlier passkey of the profile, so the lost device stops signing in. No
+  code can be issued for an admin account (another admin's or one's own); admins are recovered by
+  editing `./data/db.json`. There is still no email or self-service reset.
+  Events (issued, used, refused, revoked, rate-limited, passkey added/removed) go to `db.json`
+  `authLog` and the api log, without the code; guesses at unknown codes go to the log only.
 - **Disabling someone isn't a ban.** They can still register a fresh profile with a new passkey
   unless `INVITE_ONLY=1` is set.
 - **HTTPS is required and the app doesn't provide it.** The API container speaks plain HTTP and

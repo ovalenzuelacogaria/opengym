@@ -2,6 +2,7 @@ import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
 import { webauthnOK, passkeyLogin, passkeyRegister, recoveryCheck, recoveryFinish, api, BIO } from '../lib/api.js'
 import { hasData, DEF } from '../store/useStore.js'
+import { showNotices } from '../lib/notices.jsx'
 import { t } from '../lib/i18n.js'
 import { DEMO, REPO } from '../lib/demo.js'
 import { useState, useRef, useEffect } from 'react'
@@ -105,7 +106,11 @@ export default function Login() {
   // GUEST_MODE=0 on the server: no way in without a profile.
   const locked = useStore(s => s.locked())
   const signIn = async () => {
-    try { const u = await passkeyLogin(); setUser(u); await pullState(); useUI.getState().toast(t('Welcome back, {0}', u.name)) }
+    try {
+      const u = await passkeyLogin(); setUser(u); await pullState(); useUI.getState().toast(t('Welcome back, {0}', u.name))
+      // Security notices left for this profile while signed out.
+      api('/api/me').then(m => { if (m.notices?.length) showNotices(m.notices) }).catch(() => {})
+    }
     catch (e) { if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') useUI.getState().toast(e.message || t('Sign-in failed')) }
   }
   const head = <>

@@ -43,6 +43,11 @@ test('behind Traefik and nginx (two hops) the client is two places from the righ
   assert.equal(clientIp(req('172.18.0.3', '6.6.6.6, 203.0.113.7, 172.30.0.2'), 2), '203.0.113.7');
 });
 
+test('a chain shorter than the hops falls back to the socket peer, never to what the client wrote', () => {
+  assert.equal(clientIp(req('172.18.0.3', '6.6.6.6'), 2), '172.18.0.3');
+  assert.equal(clientIp(req('::ffff:172.18.0.3'), 2), '172.18.0.3');
+});
+
 /* ---------------- recovery codes ---------------- */
 
 test('a recovery code has 100 bits in five groups of four and survives sloppy typing', () => {

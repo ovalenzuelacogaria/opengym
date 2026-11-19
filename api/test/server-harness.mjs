@@ -53,11 +53,18 @@ export async function startServer({ db = {}, env = {} } = {}) {
   });
   const base = `http://127.0.0.1:${port}`;
 
-  async function call(method, p, { body, cookie, headers = {} } = {}) {
+  // Writes carry the app's own Origin, as a browser on the app would; `origin: null` leaves it
+  // out and `origin: '…'` forges it. `ctype`/`raw` send any content type and body (CSRF tests).
+  async function call(method, p, { body, raw, cookie, headers = {}, origin = ORIGIN, ctype = 'application/json' } = {}) {
+    const write = method !== 'GET' && method !== 'HEAD';
     const r = await fetch(base + p, {
       method,
-      headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...headers },
-      body: body === undefined ? undefined : JSON.stringify(body)
+      headers: {
+        ...(ctype ? { 'Content-Type': ctype } : {}),
+        ...(write && origin ? { Origin: origin } : {}),
+        ...(cookie ? { Cookie: cookie } : {}), ...headers
+      },
+      body: raw !== undefined ? raw : body === undefined ? (write ? '{}' : undefined) : JSON.stringify(body)
     });
     const data = await r.json().catch(() => ({}));
     const set = r.headers.get('set-cookie');
@@ -73,14 +80,17 @@ export async function startServer({ db = {}, env = {} } = {}) {
   };
 }
 
-/** A cookie exactly as server.js mints it: `<uid>:<expiry>:<session version>` + HMAC. */
-export function cookieFor(uid, sv = 0) {
-  const payload = uid + ':' + (Date.now() + 86400000) + ':' + sv;
+/** A cookie exactly as server.js mints it: `<uid>:<expiry>:<session version>` + HMAC.
+ *  `exp` overrides the expiry field (a second session of the same user, or a malformed one). */
+export function cookieFor(uid, sv = 0, exp = Date.now() + 86400000) {
+  const payload = uid + ':' + exp + ':' + sv;
   const mac = crypto.createHmac('sha256', SECRET).update(payload).digest('base64url');
   return 'gymsid=' + payload + '.' + mac;
 }
 
-/** A stored credential row for a soft authenticator that is already registered. */
+/** A stored credential row for a soft authenticator that is already registered. Also gives the
+ *  authenticator the user handle it would have got at registration. */
 export function credRow(auth, userId) {
+  auth.userHandle = Buffer.from(userId).toString('base64url');
   return { id: auth.id, userId, publicKey: auth.publicKeyB64u, counter: 0, transports: ['internal'] };
 }

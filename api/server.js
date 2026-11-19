@@ -13,12 +13,27 @@ import * as coachConfig from './coach/config.js';
 import * as coachJobs from './coach/jobs.js';
 import { coachRoutes } from './coach/routes.js';
 import { startCadence } from './coach/cadence.js';
-import { rateLimiter, clientIp, newRecoveryCode, hashCode, findRecovery, activeRecovery } from './account.js';
+import { rateLimiter, clientIp, forwardedFor, newRecoveryCode, hashCode, findRecovery, activeRecovery } from './account.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
 const RP_ID = process.env.RP_ID || 'localhost';
-const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
+// Every write is checked against ORIGIN exactly (and WebAuthn too), so a
+// stray trailing slash or path would refuse every write in silence. Keep only the origin part and
+// say at boot what was done, or why the value can't work.
+const ORIGIN = (() => {
+  const raw = process.env.ORIGIN || 'http://localhost:8080';
+  let u;
+  try { u = new URL(raw); } catch { u = null; }
+  if (!u || !/^https?:$/.test(u.protocol) || u.origin === 'null') {
+    console.error(`ORIGIN "${raw}" is not a valid origin (expected e.g. https://gym.example.com): sign-in and every write will be refused`);
+    return raw;
+  }
+  if (u.origin !== raw) console.warn(`ORIGIN "${raw}" normalized to "${u.origin}" (browsers send no path or trailing slash)`);
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+  if (u.protocol !== 'https:' && !local) console.warn(`ORIGIN "${u.origin}" is not https: browsers allow passkeys only over https (or on localhost), and the session cookie would travel in the clear`);
+  return u.origin;
+})();
 const RP_NAME = process.env.RP_NAME || 'openGym';
 // Admin dashboard (issue): admins are matched by uid; INVITE_ONLY gates new signups behind a
 // code the admin generates. Both default off so a fresh self-hosted instance stays open.
@@ -40,6 +55,8 @@ const AUTH_LIMIT_IP = Math.max(1, +(process.env.AUTH_LIMIT_IP || 20) || 20);
 const AUTH_LIMIT_USER = Math.max(1, +(process.env.AUTH_LIMIT_USER || 10) || 10);
 const AUTH_LIMIT_WINDOW_MS = Math.max(1, +(process.env.AUTH_LIMIT_WINDOW_MIN || 15) || 15) * 60000;
 const TRUST_PROXY_HOPS = Math.max(0, Math.floor(+(process.env.TRUST_PROXY_HOPS ?? 1) || 0));
+// How fresh the passkey assertion that unlocks adding or removing a passkey must be.
+const STEPUP_MAX_AGE_MS = Math.max(1, +(process.env.STEPUP_MAX_AGE_S || 300) || 300) * 1000;
 const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
@@ -195,16 +212,24 @@ function makeSession(user) {
   const exp = Date.now() + SESSION_DAYS * 86400000;
   return sign(user.id + ':' + exp + ':' + sessionVersion(user));
 }
-function readSession(req) {
+function sessionToken(req) {
   const cookies = Object.fromEntries((req.headers.cookie || '').split(';').map(c => {
     const i = c.indexOf('='); return i < 0 ? ['', ''] : [c.slice(0, i).trim(), c.slice(i + 1).trim()];
   }));
-  const tok = cookies.gymsid;
+  return cookies.gymsid || '';
+}
+// One session = one cookie value. Its hash names the session for step-up grants and security
+// notices without keeping the cookie itself anywhere.
+const sessionKeyOf = tok => tok ? crypto.createHash('sha256').update(tok).digest('base64url').slice(0, 22) : '';
+const sessionKey = req => sessionKeyOf(sessionToken(req));
+function readSession(req) {
+  const tok = sessionToken(req);
   if (!tok) return null;
   const payload = verifySig(tok);
   if (!payload) return null;
   const [uid, exp, ver] = payload.split(':');
-  if (!uid || +exp < Date.now()) return null;
+  // A non-numeric expiry would compare as never-expired (NaN < now is false): treat it as expired.
+  if (!uid || !Number.isFinite(+exp) || +exp < Date.now()) return null;
   const user = db.users.find(u => u.id === uid) || null;
   if (!user) return null;
   if (user.disabled) return null;           // disabled accounts are locked out everywhere
@@ -221,8 +246,8 @@ function requireAdmin(req, res) {
   if (!isAdmin(user)) { json(res, 403, { error: 'forbidden' }); return null; }
   return user;
 }
-function sessionCookie(user) {
-  return `gymsid=${makeSession(user)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
+function sessionCookie(user, tok = makeSession(user)) {
+  return `gymsid=${tok}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
 }
 const clearCookie = `gymsid=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
 
@@ -243,7 +268,10 @@ setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) cha
 
 /* ---------- account access: rate limits + event log ---------- */
 // One pair of limiters (per IP, per user) for each family of new routes. A family counts every
-// attempt, good or bad: the point is to cap guessing and hammering, not only failures.
+// attempt, good or bad: the point is to cap guessing and hammering, not only failures. Only the
+// calls that open a ceremony (*/options) or act on their own (remove, admin) are counted: a
+// */verify does nothing without a live, single-use challenge from its options call, so capping
+// the options caps the verifies, and a normal "add a passkey" costs 2 attempts, not 4.
 const limiterPair = () => ({
   ip: rateLimiter({ max: AUTH_LIMIT_IP, windowMs: AUTH_LIMIT_WINDOW_MS }),
   user: rateLimiter({ max: AUTH_LIMIT_USER, windowMs: AUTH_LIMIT_WINDOW_MS })
@@ -272,16 +300,61 @@ function authEvent(type, fields) {
 const credsOf = uid => db.creds.filter(c => c.userId === uid);
 const BAD_CODE = 'invalid or expired recovery code';
 
+/* ---------- step-up grants ---------- */
+// A session cookie alone must not be enough to change who can sign in: a borrowed, unlocked
+// phone or a copied cookie would otherwise plant a passkey that outlives every sign-out and
+// recovery. Adding or removing a passkey first needs a fresh assertion with a passkey the user
+// already has. Success gives a one-time grant bound to that exact session (cookie hash), its
+// session version, the user and the purpose, valid STEPUP_MAX_AGE_S.
+const STEPUP_PURPOSES = new Set(['add', 'remove', 'recovery-issue']);
+const grants = new Map(); // token -> { uid, sv, sess, purpose, exp }
+setInterval(() => { for (const [k, g] of grants) if (g.exp < Date.now()) grants.delete(k); }, 60000).unref();
+function issueGrant(user, sess, purpose) {
+  const token = crypto.randomBytes(24).toString('base64url');
+  grants.set(token, { uid: user.id, sv: sessionVersion(user), sess, purpose, exp: Date.now() + STEPUP_MAX_AGE_MS });
+  return token;
+}
+// Consumes the grant whatever the outcome; true only if it fits this request exactly.
+function takeGrant(token, user, req, purpose) {
+  const g = typeof token === 'string' ? grants.get(token) : null;
+  if (!g) return false;
+  grants.delete(token);
+  return g.exp >= Date.now() && g.uid === user.id && g.sv === sessionVersion(user) && g.sess === sessionKey(req) && g.purpose === purpose;
+}
+
+/* ---------- security notices ---------- */
+// Shown in the app at the next load of every OTHER session of the user (no e-mail in openGym):
+// "a passkey was added / removed", "access was recovered". The session that acted is not told.
+function notify(user, type, sess, extra = {}) {
+  user.notices = (user.notices || []).filter(n => !n.seen).slice(-19);
+  user.notices.push({ id: crypto.randomBytes(6).toString('base64url'), at: new Date().toISOString(), type, sess, ...extra });
+}
+const pendingNotices = (user, req) => (user.notices || [])
+  .filter(n => !n.seen && n.sess !== sessionKey(req))
+  .map(({ id, at, type, device }) => ({ id, at, type, ...(device ? { device } : {}) }));
+
+// What a passkey row says about where it lives, read from the request that created it. For a
+// passkey made on a phone through the desktop's QR dialog the browser reports 'cross-platform'.
+function deviceOf(req, body) {
+  const ua = String(req.headers['user-agent'] || '');
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android'
+    : /Windows/.test(ua) ? 'Windows' : /Mac OS X|Macintosh/.test(ua) ? 'Mac' : /CrOS/.test(ua) ? 'ChromeOS' : /Linux/.test(ua) ? 'Linux' : '';
+  const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : '';
+  const att = body?.credential?.authenticatorAttachment;
+  return { os, browser, attachment: att === 'cross-platform' || att === 'platform' ? att : '' };
+}
+const publicPasskey = c => ({ id: c.id, device: c.device || null, created: c.created || null, lastUsed: c.lastUsed || null, via: c.via || null });
+
 // Registration options for a passkey on an EXISTING profile (add or recover). Same user handle
 // as the original sign-up (Buffer.from(uid)), the user's current passkeys excluded, UV required.
 // @simplewebauthn/server 13.3.2: generateRegistrationOptions({ userID: Uint8Array, excludeCredentials: [{ id, transports }] }).
-function registrationOptionsFor(user) {
+function registrationOptionsFor(user, { exclude = true } = {}) {
   return generateRegistrationOptions({
     rpName: RP_NAME, rpID: RP_ID,
     userID: Buffer.from(user.id), userName: user.name, userDisplayName: user.name,
     attestationType: 'none',
     authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
-    excludeCredentials: credsOf(user.id).map(c => ({ id: c.id, transports: c.transports }))
+    excludeCredentials: exclude ? credsOf(user.id).map(c => ({ id: c.id, transports: c.transports })) : []
   });
 }
 // Verifies a registration response against a stored challenge; answers 400 itself and returns
@@ -300,8 +373,9 @@ async function verifyNewCredential(res, body, c) {
   if (!verification.verified) { json(res, 400, { error: 'not verified' }); return null; }
   return verification.registrationInfo.credential;
 }
-function storeCredential(user, credential, body, via) {
+function storeCredential(user, credential, body, via, req) {
   db.creds.push({
+    device: deviceOf(req, body),
     id: credential.id, userId: user.id,
     publicKey: Buffer.from(credential.publicKey).toString('base64url'),
     counter: credential.counter || 0,
@@ -350,7 +424,8 @@ setInterval(() => { for (const [k, v] of presence) if (Date.now() - v.updatedAt 
 
 /* ---------- routes ---------- */
 const routes = {
-  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
+  // With GUEST_MODE=0 the count of profiles is nobody's business before signing in.
+  'GET /api/health': async (req, res) => json(res, 200, GUEST_MODE ? { ok: true, users: db.users.length } : { ok: true }),
 
   // Public config the login screen needs before anyone is signed in. `coach` is absent unless
   // the instance has both switched the Coach on and successfully connected a provider — the
@@ -364,7 +439,17 @@ const routes = {
   'GET /api/me': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } });
+    // `notices`: security events this session has not seen (passkey added/removed, recovery).
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) }, notices: pendingNotices(user, req) });
+  },
+
+  // The app shows the notices once; this marks every pending one as seen.
+  'POST /api/notices/ack': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    for (const n of user.notices || []) n.seen = true;
+    saveDb();
+    json(res, 200, { ok: true });
   },
 
   'POST /api/register/options': async (req, res) => {
@@ -418,7 +503,9 @@ const routes = {
       id: credential.id, userId: user.id,
       publicKey: Buffer.from(credential.publicKey).toString('base64url'),
       counter: credential.counter || 0,
-      transports: body.credential?.response?.transports || []
+      transports: body.credential?.response?.transports || [],
+      // What Settings → Passkeys shows for it.
+      device: deviceOf(req, body), created: user.created, via: 'signup'
     });
     saveDb();
     json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
@@ -456,6 +543,7 @@ const routes = {
     } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
     if (!verification.verified) return json(res, 400, { error: 'not verified' });
     cred.counter = verification.authenticationInfo.newCounter;
+    cred.lastUsed = new Date().toISOString();   // shown in Settings -> passkeys
     saveDb();
     const user = db.users.find(u => u.id === cred.userId);
     if (!user) return json(res, 500, { error: 'user missing' });
@@ -478,37 +566,106 @@ const routes = {
   },
 
   /* ---------- more passkeys on the same profile ---------- */
-  // Signed-in only. The new credential is created under the SAME user handle as the profile, so
-  // sign-in on the new device resolves to the same user; passkeys already on file are excluded,
-  // so an authenticator that has one isn't asked to make a duplicate. User verification is
-  // required here (not just preferred): adding a key is a change to who can get in.
+  // Signed-in AND a fresh assertion with a passkey the user already has (step-up): a cookie alone can't change who can sign in. The new credential is created under
+  // the SAME user handle as the profile; passkeys already on file are excluded; user verification
+  // is required.
+  'POST /api/passkeys/stepup/options': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    if (overLimit(req, res, 'passkey', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    if (overLimit(req, res, 'passkey', 'user', user.id)) return;
+    const body = await readBody(req);
+    const purpose = String(body.purpose || '');
+    if (!STEPUP_PURPOSES.has(purpose)) return json(res, 400, { error: 'unknown purpose' });
+    const options = await generateAuthenticationOptions({
+      rpID: RP_ID, userVerification: 'required',
+      allowCredentials: credsOf(user.id).map(c => ({ id: c.id, transports: c.transports }))
+    });
+    const cid = putChallenge({ purpose: 'stepup', challenge: options.challenge, uid: user.id, sv: sessionVersion(user), sess: sessionKey(req), for: purpose });
+    json(res, 200, { cid, options });
+  },
+
+  'POST /api/passkeys/stepup/verify': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    const body = await readBody(req);
+    const c = takeChallenge(body.cid);
+    if (!c || c.purpose !== 'stepup') return json(res, 400, { error: 'challenge expired — try again' });
+    if (c.uid !== user.id || c.sv !== sessionVersion(user) || c.sess !== sessionKey(req)) return json(res, 403, { error: 'forbidden' });
+    // The assertion has to come from one of THIS user's passkeys.
+    const cred = db.creds.find(x => x.id === body.credential?.id);
+    if (!cred || cred.userId !== user.id) return json(res, 403, { error: 'that passkey is not one of yours' });
+    let verification;
+    try {
+      verification = await verifyAuthenticationResponse({
+        response: body.credential, expectedChallenge: c.challenge, expectedOrigin: ORIGIN, expectedRPID: RP_ID,
+        requireUserVerification: true,
+        credential: { id: cred.id, publicKey: b64uToBuf(cred.publicKey), counter: cred.counter, transports: cred.transports }
+      });
+    } catch (e) { return json(res, 400, { error: 'verification failed: ' + e.message }); }
+    if (!verification.verified) return json(res, 400, { error: 'not verified' });
+    if (user.disabled || sessionVersion(user) !== c.sv || !credsOf(user.id).includes(cred)) return json(res, 403, { error: 'forbidden' });
+    cred.counter = verification.authenticationInfo.newCounter;
+    cred.lastUsed = new Date().toISOString();
+    saveDb();
+    json(res, 200, { grant: issueGrant(user, c.sess, c.for), expiresIn: Math.round(STEPUP_MAX_AGE_MS / 1000) });
+  },
+
   'POST /api/passkeys/options': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
     if (overLimit(req, res, 'passkey', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
     if (overLimit(req, res, 'passkey', 'user', user.id)) return;
+    const body = await readBody(req);
+    if (!takeGrant(body.grant, user, req, 'add')) return json(res, 403, { error: 'confirm with one of your passkeys first' });
     const options = await registrationOptionsFor(user);
-    const cid = putChallenge({ purpose: 'add', challenge: options.challenge, uid: user.id, sv: sessionVersion(user) });
+    const cid = putChallenge({ purpose: 'add', challenge: options.challenge, uid: user.id, sv: sessionVersion(user), sess: sessionKey(req) });
     json(res, 200, { cid, options });
   },
 
   'POST /api/passkeys/verify': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    if (overLimit(req, res, 'passkey', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
-    if (overLimit(req, res, 'passkey', 'user', user.id)) return;
     const body = await readBody(req);
     const c = takeChallenge(body.cid);
     if (!c || c.purpose !== 'add') return json(res, 400, { error: 'challenge expired — try again' });
     // The ceremony belongs to the session that started it, and only while that session lives.
-    if (c.uid !== user.id || c.sv !== sessionVersion(user)) return json(res, 403, { error: 'forbidden' });
+    if (c.uid !== user.id || c.sv !== sessionVersion(user) || c.sess !== sessionKey(req)) return json(res, 403, { error: 'forbidden' });
     const credential = await verifyNewCredential(res, body, c);
     if (!credential) return;
     // Re-check after the await: the account may have been disabled or signed out meanwhile.
     if (user.disabled || sessionVersion(user) !== c.sv || !db.users.includes(user)) return json(res, 403, { error: 'forbidden' });
     if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
-    storeCredential(user, credential, body, 'add');
-    authEvent('passkey.added', { userId: user.id, credId: credential.id.slice(0, 12), ip: clientIp(req, TRUST_PROXY_HOPS) });
+    storeCredential(user, credential, body, 'add', req);
+    const device = deviceOf(req, body);
+    notify(user, 'passkey.added', c.sess, { device });
+    authEvent('passkey.added', { userId: user.id, credId: credential.id.slice(0, 12), device, ip: clientIp(req, TRUST_PROXY_HOPS) });
+    saveDb();
+    json(res, 200, { ok: true, passkeys: credsOf(user.id).length });
+  },
+
+  // The user's own passkeys, for Settings. Never key material.
+  'GET /api/passkeys': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    json(res, 200, { passkeys: credsOf(user.id).map(publicPasskey) });
+  },
+
+  // Remove one of the user's passkeys: also behind a step-up (a cookie thief must not be able to
+  // lock the owner out), and never the last one (that is what recovery is for).
+  'POST /api/passkeys/remove': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    if (overLimit(req, res, 'passkey', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    if (overLimit(req, res, 'passkey', 'user', user.id)) return;
+    const body = await readBody(req);
+    if (!takeGrant(body.grant, user, req, 'remove')) return json(res, 403, { error: 'confirm with one of your passkeys first' });
+    const cred = credsOf(user.id).find(c => c.id === body.id);
+    if (!cred) return json(res, 404, { error: 'no such passkey' });
+    if (credsOf(user.id).length <= 1) return json(res, 400, { error: 'this is your only passkey — it cannot be removed' });
+    db.creds = db.creds.filter(c => c !== cred);
+    notify(user, 'passkey.removed', sessionKey(req), { device: cred.device || null });
+    authEvent('passkey.removed', { userId: user.id, credId: cred.id.slice(0, 12), ip: clientIp(req, TRUST_PROXY_HOPS) });
     saveDb();
     json(res, 200, { ok: true, passkeys: credsOf(user.id).length });
   },
@@ -516,32 +673,40 @@ const routes = {
   /* ---------- recovery with an admin-issued, one-time code ---------- */
   // No session: this is how someone who lost their device gets back in. The code names the
   // account (it is bound to one user when issued); nothing the client sends can point it at
-  // another. It is burned only when a new passkey has actually been verified.
+  // another. It is burned only when a new passkey has actually been verified, and then every
+  // OTHER passkey of the account is removed: the lost device, and anything planted with a stolen
+  // session, stops signing in.
   'POST /api/recovery/options': async (req, res) => {
     if (overLimit(req, res, 'recovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
     const body = await readBody(req);
     const found = findRecovery(db.recovery, SECRET, body.code);
     const user = found.ok ? db.users.find(u => u.id === found.record.userId) : null;
     if (!found.ok || !user || user.disabled) {
-      // A known code that can't be used is worth a line in the log; a random guess is not.
+      const ip = clientIp(req, TRUST_PROXY_HOPS), xff = forwardedFor(req).length;
       if (found.record) {
-        authEvent('recovery.refused', { userId: found.record.userId, reason: found.ok ? 'account' : found.reason, ip: clientIp(req, TRUST_PROXY_HOPS) });
+        // A known code that can't be used: worth keeping in db.json.
+        authEvent('recovery.refused', { userId: found.record.userId, reason: found.ok ? 'account' : found.reason, ip, xff });
         saveDb();
+      } else {
+        // A guess: to the log only (bounded by the per-IP limit). It also shows which address the
+        // server settled on and how long the X-Forwarded-For chain was: the way to check
+        // TRUST_PROXY_HOPS on a deployment (see LEEME).
+        console.log('auth-event ' + JSON.stringify({ at: new Date().toISOString(), type: 'recovery.refused', reason: 'unknown', ip, xff }));
       }
       return json(res, 400, { error: BAD_CODE });
     }
     if (overLimit(req, res, 'recovery', 'user', user.id)) return;
-    const options = await registrationOptionsFor(user);
+    // No exclude list: the account's old passkeys are about to go, and a phone that still holds
+    // one simply overwrites it under the same user handle.
+    const options = await registrationOptionsFor(user, { exclude: false });
     const cid = putChallenge({ purpose: 'recover', challenge: options.challenge, uid: user.id, recId: found.record.id });
     json(res, 200, { cid, options, name: user.name });
   },
 
   'POST /api/recovery/verify': async (req, res) => {
-    if (overLimit(req, res, 'recovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
     const body = await readBody(req);
     const c = takeChallenge(body.cid);
     if (!c || c.purpose !== 'recover') return json(res, 400, { error: 'challenge expired — try again' });
-    if (overLimit(req, res, 'recovery', 'user', c.uid)) return;
     const credential = await verifyNewCredential(res, body, c);
     if (!credential) return;
     // Everything from here to saveDb() is synchronous, so two ceremonies racing on one code
@@ -550,14 +715,18 @@ const routes = {
     const user = db.users.find(u => u.id === c.uid);
     if (!rec || rec.userId !== c.uid || rec.usedAt || rec.revokedAt || !(rec.exp > Date.now()) || !user || user.disabled)
       return json(res, 400, { error: BAD_CODE });
-    if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
+    if (db.creds.find(x => x.id === credential.id && x.userId !== user.id)) return json(res, 409, { error: 'credential already registered' });
     rec.usedAt = new Date().toISOString();
-    storeCredential(user, credential, body, 'recovery');
+    const removed = credsOf(user.id).length;
+    db.creds = db.creds.filter(x => x.userId !== user.id);
+    storeCredential(user, credential, body, 'recovery', req);
     // Whoever has the lost device keeps its cookie until expiry otherwise: end every session.
     user.sv = sessionVersion(user) + 1;
-    authEvent('recovery.used', { userId: user.id, recId: rec.id, credId: credential.id.slice(0, 12), ip: clientIp(req, TRUST_PROXY_HOPS) });
+    const tok = makeSession(user);
+    notify(user, 'recovery.used', sessionKeyOf(tok), { device: deviceOf(req, body) });
+    authEvent('recovery.used', { userId: user.id, recId: rec.id, credId: credential.id.slice(0, 12), removedPasskeys: removed, ip: clientIp(req, TRUST_PROXY_HOPS) });
     saveDb();
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user, tok) });
   },
 
   'GET /api/data': async (req, res) => {
@@ -738,9 +907,18 @@ const routes = {
     if (overLimit(req, res, 'adminRecovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
     if (overLimit(req, res, 'adminRecovery', 'user', admin.id)) return;
     const body = await readBody(req);
+    // A code lets someone in and, since recovery removes every earlier
+    // passkey, locks the owner out. So the admin's cookie alone is not enough: the same step-up
+    // as adding a passkey, with its own purpose, from one of the ADMIN's passkeys. (Revoking a
+    // code stays cookie-only: it lets nobody in, and it must be quick when a code went astray.)
+    if (!takeGrant(body.grant, admin, req, 'recovery-issue')) return json(res, 403, { error: 'confirm with one of your passkeys first' });
     const u = db.users.find(x => x.id === body.id);
     if (!u) return json(res, 404, { error: 'no such user' });
     if (u.disabled) return json(res, 400, { error: 'account is disabled — enable it first' });
+    // No admin account, the issuer's own included: a code is a way into an
+    // account, and admins are recovered by hand (db.json), not by another admin's click, and not
+    // by whoever holds an admin's cookie.
+    if (isAdmin(u)) return json(res, 400, { error: 'cannot issue a recovery code for an admin account' });
     const hours = Math.min(72, Math.max(1, Math.round(+body.hours || RECOVERY_HOURS)));
     const now = Date.now();
     for (const r of db.recovery) if (r.userId === u.id && !r.usedAt && !r.revokedAt && r.exp > now) r.revokedAt = new Date(now).toISOString();
@@ -804,6 +982,16 @@ http.createServer(async (req, res) => {
   const key = req.method + ' ' + url.pathname;
   const handler = routes[key];
   if (!handler) return json(res, 404, { error: 'not found' });
+  // Cross-site writes. SameSite=Lax still sends the cookie from a page on
+  // any other subdomain of the same registrable domain (same site for the browser),
+  // and a text/plain body needs no CORS preflight. So every request that can change something
+  // must be JSON and come from the app's own origin, exactly. Browsers send Origin on every
+  // non-GET/HEAD request; one without it is not the app, so it is refused too.
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const ctype = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (ctype !== 'application/json') return json(res, 415, { error: 'content-type must be application/json' });
+    if (req.headers.origin !== ORIGIN) return json(res, 403, { error: 'cross-origin request refused' });
+  }
   // GUEST_MODE=0: deny by default. Only what the sign-in screen needs answers without a session;
   // every other route — today's and any added later — is 401 before its handler runs.
   if (!GUEST_MODE && !PUBLIC_ROUTES.has(key) && !readSession(req)) return json(res, 401, { error: 'not signed in' });

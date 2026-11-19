@@ -29,14 +29,19 @@ export function rateLimiter({ max, windowMs }) {
 // nginx = 2). Each trusted proxy appends the address it saw to X-Forwarded-For, so the client
 // is the entry `hops` places from the right once the socket peer is appended. Anything further
 // left was written by the client and is ignored, which is what makes the header unspoofable.
+// If the chain is shorter than `hops`, some proxy that should have written an entry didn't (or
+// the request skipped it): the socket peer is then the only address nobody but the network
+// chose, so that is the answer — never an entry the client may have written.
 export function clientIp(req, hops = 0) {
   const peer = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
   if (!hops) return peer;
-  const xff = String(req.headers?.['x-forwarded-for'] || '')
-    .split(',').map(s => s.trim()).filter(Boolean);
-  const chain = [...xff, peer];
+  const chain = [...forwardedFor(req), peer];
   const i = chain.length - 1 - hops;
-  return (i >= 0 ? chain[i] : chain[0]).replace(/^::ffff:/, '');
+  return (i >= 0 ? chain[i] : peer).replace(/^::ffff:/, '');
+}
+// The X-Forwarded-For entries as received (for logging how long the chain was).
+export function forwardedFor(req) {
+  return String(req.headers?.['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
 /* ---------- recovery codes ---------- */
@@ -58,10 +63,12 @@ export function normalizeCode(input) {
     .replace(/O/g, '0').replace(/[IL]/g, '1').slice(0, 64);
 }
 
-// HMAC under the instance secret: a stolen db.json alone doesn't let anyone test guesses offline,
-// and 100 bits of entropy makes a slow KDF unnecessary.
+// HMAC under a key derived from the instance secret: a stolen db.json alone doesn't let anyone
+// test guesses offline, 100 bits of entropy makes a slow KDF unnecessary, and the derived key
+// keeps these MACs apart from the session-cookie MACs made with the secret itself.
 export function hashCode(secret, code) {
-  return crypto.createHmac('sha256', secret).update('recovery:' + normalizeCode(code)).digest('base64url');
+  const key = crypto.createHmac('sha256', secret).update('opengym recovery-code key v1').digest();
+  return crypto.createHmac('sha256', key).update(normalizeCode(code)).digest('base64url');
 }
 
 // Every stored record is compared, valid or not, in constant time per record, so the response

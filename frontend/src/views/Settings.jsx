@@ -4,7 +4,8 @@ import { useStore, DEF, hasData } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
 import { ACCENTS, todayISO, localTZ } from '../lib/format.js'
 import { effortOf } from '../lib/history.js'
-import { webauthnOK, passkeyLogin, passkeyRegister, passkeyAdd, IS_ANDROID } from '../lib/api.js'
+import { webauthnOK, passkeyLogin, passkeyRegister, passkeyAdd, passkeyStepUp, passkeyList, passkeyRemove, IS_ANDROID } from '../lib/api.js'
+import { passkeyLabel, fmtWhen } from '../lib/passkeys.js'
 import { pushSupported, enablePush, disablePush, sendTestPush } from '../lib/push.js'
 import { wakeLockSupported } from '../lib/wakelock.js'
 import { t, LANGS, INSTR_LANGS } from '../lib/i18n.js'
@@ -55,18 +56,6 @@ export default function Settings() {
     try { const u = await passkeyLogin(); setUser(u); await pullState(); toast(t('Welcome back, {0}', u.name)) }
     catch (e) { if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') toast(e.message || t('Sign-in failed')) }
   }
-  // Another passkey for this same profile — on this device, or on a
-  // phone or security key through the browser's own dialog (QR code).
-  const addPasskey = async () => {
-    try { const r = await passkeyAdd(); toast(t('Passkey added — this profile now has {0}', r.passkeys)) }
-    catch (e) {
-      if (e.name === 'NotAllowedError' || e.name === 'AbortError') return
-      if (e.name === 'InvalidStateError' || e.status === 409) toast(t('This device already has a passkey for your profile.'))
-      else if (e.status === 429) toast(t('Too many attempts — wait a few minutes and try again.'))
-      else if (e.status === 401) toast(t('Your session has ended — sign in again first.'))
-      else toast(e.message || t('Could not add the passkey'))
-    }
-  }
   const registerHere = () => useUI.getState().openSheet(close => <RegisterInline close={close} setUser={setUser} pushState={pushState} pullState={pullState} toast={toast} />)
   // Ends the profile's sessions on every device — this one included, so on success it lands in
   // the same place as the plain sign-out above (home, local data cleared). On failure nothing
@@ -101,8 +90,6 @@ export default function Settings() {
           onClick={() => window.open(REPO, '_blank', 'noopener')} />
       </> : user ? <>
         <Row icon="personCircle" iconTint="var(--grey)" title={user.name} subtitle={t('Signed in with passkey — data syncs to this profile.')} />
-        {webauthnOK() && <Row icon="key" iconTint="var(--acc)" title={t('Add a passkey on this or another device')}
-          subtitle={t('Sign in to this same profile from your phone or another computer too.')} accessory="chevron" onClick={addPasskey} />}
         {user.admin && <Row icon="wrench" iconTint="var(--indigo)" title={t('Admin dashboard')} accessory="chevron" onClick={() => nav('/admin')} />}
         <Row icon="signOut" iconTint="var(--red)" title={t('Sign out')} danger onClick={() => confirmSheet({ title: t('Sign out?'), message: t('Your data is synced to your profile first, then cleared from this device.'), confirmText: t('Sign out'), danger: true, onConfirm: () => { signOut(); nav('/home') } })} />
         <Row icon="shield" iconTint="var(--red)" title={t('Sign out everywhere')} subtitle={t('Ends this profile’s sessions on all your devices.')} danger onClick={signOutEverywhere} />
@@ -113,6 +100,7 @@ export default function Settings() {
         <Row icon="lock" iconTint="var(--grey)" title={t('Passkeys not supported in this browser.')} />
       )}
     </Section>
+    {user && !DEMO && !MOBILE && webauthnOK() && <PasskeysSection toast={toast} />}
     {!user && !DEMO && !MOBILE && <p className="sect-f" style={{ marginTop: -18, marginBottom: 22 }}>{t('Guest mode — data lives only in this browser.')}</p>}
 
     {/* ---------- general ---------- */}
@@ -353,6 +341,66 @@ function PushCard({ S, update, toast }) {
       )}
     </Section>
     {on && <div style={{ marginTop: -12, marginBottom: 22 }}><Button size="sm" icon="bell" onClick={test}>{t('Send test notification')}</Button></div>}
+  </>
+}
+
+/* ---------- passkeys of this profile ---------- */
+// Adding or removing one first asks for one of the passkeys already on the profile (the server
+// requires that step-up; a stolen cookie alone can do neither).
+const passkeyError = e =>
+  e.name === 'InvalidStateError' || e.status === 409 ? t('This device already has a passkey for your profile.')
+  : e.status === 429 ? t('Too many attempts — wait a few minutes and try again.')
+  : e.status === 401 ? t('Your session has ended — sign in again first.')
+  : e.status === 403 ? t('Confirm with one of your passkeys first — or that took too long. Start again.')
+  : (e.message || t('Something went wrong'))
+const cancelled = e => e.name === 'NotAllowedError' || e.name === 'AbortError'
+
+function PasskeysSection({ toast }) {
+  const [list, setList] = useState(null)
+  const load = () => passkeyList().then(setList).catch(() => setList([]))
+  useEffect(() => { load() }, [])
+  const add = async () => {
+    let grant
+    try { grant = await passkeyStepUp('add') } catch (e) { if (!cancelled(e)) toast(passkeyError(e)); return }
+    useUI.getState().openSheet(close => <AddPasskeySheet grant={grant} close={close} done={n => { load(); toast(t('Passkey added — this profile now has {0}', n)) }} />)
+  }
+  const remove = p => confirmSheet({
+    title: t('Remove this passkey?'),
+    message: t('{0} will no longer sign in to this profile. If the device was lost or stolen, also use “Sign out everywhere”.', passkeyLabel(p, t)),
+    confirmText: t('Remove'), danger: true,
+    onConfirm: async () => {
+      try { const grant = await passkeyStepUp('remove'); await passkeyRemove(p.id, grant); load(); toast(t('Passkey removed')) }
+      catch (e) { if (!cancelled(e)) toast(passkeyError(e)) }
+    },
+  })
+  const only = (list || []).length <= 1
+  return <Section title={t('Passkeys')} footer={list && only ? t('Your only passkey can’t be removed — add another one first.') : t('You confirm with one of your passkeys before adding or removing one.')}>
+    {(list || []).map(p => (
+      <Row key={p.id} icon="key" iconTint="var(--grey)" title={passkeyLabel(p, t)}
+        subtitle={[p.created && t('Added {0}', fmtWhen(p.created)), p.lastUsed ? t('last used {0}', fmtWhen(p.lastUsed)) : t('not used yet')].filter(Boolean).join(' · ')}>
+        <Button size="sm" variant="danger" disabled={only} onClick={() => remove(p)} aria-label={t('Remove') + ' ' + passkeyLabel(p, t)}>{t('Remove')}</Button>
+      </Row>
+    ))}
+    <Row icon="plus" iconTint="var(--acc)" title={t('Add a passkey on this or another device')}
+      subtitle={t('Sign in to this same profile from your phone or another computer too.')} accessory="chevron" onClick={add} />
+  </Section>
+}
+
+// Second tap on purpose: Safari only opens the passkey dialog straight from a user gesture.
+function AddPasskeySheet({ grant, close, done }) {
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const go = async () => {
+    setBusy(true); setErr('')
+    try { const r = await passkeyAdd(grant); close(); done(r.passkeys) }
+    catch (e) { if (!cancelled(e)) setErr(passkeyError(e)) }
+    setBusy(false)
+  }
+  return <>
+    <h3>{t('Add a passkey')}</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>{t('Confirmed. Now create the new passkey: on this device, or pick a phone or security key in the next dialog (it shows a QR code).')}</div>
+    <Button variant="primary" icon="key" disabled={busy} onClick={go}>{t('Create passkey')}</Button>
+    {err && <div role="alert" className="small" style={{ color: 'var(--red)', marginTop: 10 }}>{err}</div>}
   </>
 }
 

@@ -27,6 +27,42 @@ No account on someone else's server, no subscription, no ads. Just `docker compo
 
 <br>
 
+## About this fork
+
+This repository is a fork of [alexpcosta/opengym](https://github.com/alexpcosta/opengym)
+(commit `678bf5b`), which is itself a fork of
+[DuarteSantos8/openGym](https://github.com/DuarteSantos8/openGym) by Duarte Santos. It stays
+under the same license, **GNU AGPL v3.0** ([LICENSE](LICENSE), [NOTICE.md](NOTICE.md)).
+
+What it adds on top:
+
+- **Passkeys on several devices.** Settings → Passkeys lists the profile's passkeys (device,
+  added, last used) and adds one on this or another device (a phone over QR, a security key).
+  Adding or removing a passkey first asks for one you already have.
+- **Recovery by admin-issued code.** An admin generates a one-time code for a user who lost
+  every device. It is valid 24 h by default (`RECOVERY_HOURS`) and stored only as a hash.
+  On the new device, "Recover access with a code" registers a new passkey, removes the earlier
+  ones and signs the profile out everywhere. Issuing a code needs the admin's own passkey.
+  Admin accounts can't be recovered this way.
+- **Optional guest mode.** With `GUEST_MODE=0` there is no "continue without account": the app
+  shows only the sign-in screen, and the server answers nothing outside it without a session.
+- **Security hardening.** Writes must be same-origin JSON, rate limits apply to the new routes,
+  account events are logged without secrets, and other sessions see a notice when a passkey
+  is added or removed.
+- **The Coach can use an Anthropic API key** from the server environment
+  (`COACH_ANTHROPIC_API_KEY`) instead of a subscription token.
+
+Settings that matter for this fork (details in [Configuration](#configuration) and
+[SECURITY.md](SECURITY.md)):
+
+| Variable | What to set |
+|---|---|
+| `GUEST_MODE` | `0` to require signing in; unset keeps guest mode, as upstream |
+| `ORIGIN` | Exactly the URL the browser uses, e.g. `https://gym.example.com`; every write is checked against it |
+| `TRUST_PROXY_HOPS` | How many reverse proxies sit in front of the api: `1` for the bundled nginx, `2` with another proxy in front of it |
+
+<br>
+
 > ### 🤖 This is a fork — it adds the AI Coach
 >
 > A fork of [DuarteSantos8/openGym](https://github.com/DuarteSantos8/openGym) that adds one
@@ -174,6 +210,7 @@ All via `.env` (see `.env.example`):
 | `RECOVERY_HOURS` | How long an admin-issued recovery code stays valid (1-72) | `24`              |
 | `AUTH_LIMIT_IP` / `AUTH_LIMIT_USER` | Attempts per window on the add-passkey and recovery routes, per IP / per user | `20` / `10` |
 | `AUTH_LIMIT_WINDOW_MIN` | Length of that window, in minutes                | `15`                    |
+| `STEPUP_MAX_AGE_S` | How long a passkey confirmation unlocks adding/removing a passkey, in seconds | `300` |
 | `TRUST_PROXY_HOPS` | Reverse proxies in front of the api (nginx = 1; another proxy in front of nginx = 2) | `1` |
 
 Push notification keys are generated on first run and saved to `./data/vapid.json` — nothing to set.

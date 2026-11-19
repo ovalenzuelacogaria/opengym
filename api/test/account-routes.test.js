@@ -49,10 +49,28 @@ async function login(auth) {
   const v = await srv.call('POST', '/api/login/verify', { body: { cid: o.data.cid, credential: auth.authenticate(o.data.options) } });
   return v;
 }
-async function addPasskey(cookie, auth) {
-  const o = await srv.call('POST', '/api/passkeys/options', { body: {}, cookie });
+// Adding needs a fresh assertion with a passkey the user already has.
+async function grantFor(cookie, existing) {
+  const o = await srv.call('POST', '/api/passkeys/stepup/options', { body: { purpose: 'add' }, cookie });
+  const v = await srv.call('POST', '/api/passkeys/stepup/verify', { body: { cid: o.data.cid, credential: existing.authenticate(o.data.options) }, cookie });
+  assert.equal(v.status, 200, 'step-up: ' + JSON.stringify(v.data));
+  return v.data.grant;
+}
+async function addOptions(cookie, existing) {
+  return srv.call('POST', '/api/passkeys/options', { body: { grant: await grantFor(cookie, existing) }, cookie });
+}
+async function addPasskey(cookie, auth, existing) {
+  const o = await addOptions(cookie, existing);
   if (o.status !== 200) return o;
   return srv.call('POST', '/api/passkeys/verify', { body: { cid: o.data.cid, credential: auth.register(o.data.options) }, cookie });
+}
+// Issuing a recovery code needs the admin's own passkey too.
+async function issue(id, { server = srv, cookie = ADMIN, key = adminKey } = {}) {
+  const o = await server.call('POST', '/api/passkeys/stepup/options', { body: { purpose: 'recovery-issue' }, cookie });
+  if (o.status !== 200) return o;
+  const v = await server.call('POST', '/api/passkeys/stepup/verify', { body: { cid: o.data.cid, credential: key.authenticate(o.data.options) }, cookie });
+  if (v.status !== 200) return v;
+  return server.call('POST', '/api/admin/recovery/new', { body: { id, grant: v.data.grant }, cookie });
 }
 async function recover(code, auth) {
   const o = await srv.call('POST', '/api/recovery/options', { body: { code } });
@@ -69,7 +87,7 @@ test('adding a passkey needs a session (bad) — and with one it lands on the sa
   assert.equal(anon.status, 401);
 
   const iphone = dev();
-  const o = await srv.call('POST', '/api/passkeys/options', { body: {}, cookie: ALICE });
+  const o = await addOptions(ALICE, aliceWin);
   assert.equal(o.status, 200);
   assert.equal(o.data.options.user.id, b64u('alice1'), 'the authenticator files it under the same user handle');
   assert.equal(o.data.options.authenticatorSelection.userVerification, 'required');
@@ -92,7 +110,7 @@ test('adding a passkey needs a session (bad) — and with one it lands on the sa
 
 test("one user's add-passkey ceremony can't be finished in another user's session", async () => {
   const before = srv.db().creds.length;
-  const o = await srv.call('POST', '/api/passkeys/options', { body: {}, cookie: ALICE });
+  const o = await addOptions(ALICE, aliceWin);
   const v = await srv.call('POST', '/api/passkeys/verify', { body: { cid: o.data.cid, credential: dev().register(o.data.options) }, cookie: BOB });
   assert.equal(v.status, 403);
   assert.equal(srv.db().creds.length, before);
@@ -100,22 +118,22 @@ test("one user's add-passkey ceremony can't be finished in another user's sessio
 
 test('adding a passkey without user verification is refused (bad) — with it, accepted (twin)', async () => {
   const before = credsOf('bob1').length;
-  const noUv = await addPasskey(BOB, dev({ uv: false }));
+  const noUv = await addPasskey(BOB, dev({ uv: false }), bobOld);
   assert.equal(noUv.status, 400);
   assert.equal(credsOf('bob1').length, before);
-  const withUv = await addPasskey(BOB, dev());
+  const withUv = await addPasskey(BOB, dev(), bobOld);
   assert.equal(withUv.status, 200);
   assert.equal(credsOf('bob1').length, before + 1);
 });
 
 test('the same authenticator twice is a conflict, not a second row', async () => {
-  const again = await addPasskey(ALICE, aliceWin);
+  const again = await addPasskey(ALICE, aliceWin, aliceWin);
   assert.equal(again.status, 409);
 });
 
 test("an add-passkey challenge can't be replayed at sign-up to clone the profile", async () => {
   const usersBefore = srv.db().users.length;
-  const o = await srv.call('POST', '/api/passkeys/options', { body: {}, cookie: ALICE });
+  const o = await addOptions(ALICE, aliceWin);
   const r = await srv.call('POST', '/api/register/verify', { body: { cid: o.data.cid, credential: dev().register(o.data.options) } });
   assert.equal(r.status, 400);
   assert.equal(srv.db().users.length, usersBefore);
@@ -135,11 +153,11 @@ test('plain sign-up still makes a new profile (the original flow is untouched)',
 test('only an admin can issue a recovery code', async () => {
   assert.equal((await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'alice1' } })).status, 401);
   assert.equal((await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'alice1' }, cookie: BOB })).status, 403);
-  assert.equal((await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'nobody' }, cookie: ADMIN })).status, 404);
+  assert.equal((await issue('nobody')).status, 404);
 });
 
 test('a code recovers the account on a new device: same user, passkey bound to it, old sessions ended', async () => {
-  const issued = await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'alice1' }, cookie: ADMIN });
+  const issued = await issue('alice1');
   assert.equal(issued.status, 200);
   const { code, exp } = issued.data;
   assert.match(code, /^[0-9A-Z]{4}(-[0-9A-Z]{4}){4}$/);
@@ -171,7 +189,8 @@ test('a code recovers the account on a new device: same user, passkey bound to i
 
   const db = srv.db();
   assert.equal(db.users.length, usersBefore, 'no new profile');
-  assert.ok(credsOf('alice1').some(c => c.id === phone.id));
+  assert.deepEqual(credsOf('alice1').map(c => c.id), [phone.id], 'only the new passkey is left');
+  assert.notEqual((await login(aliceWin)).status, 200, 'the lost device no longer signs in');
   assert.equal(db.users.find(u => u.id === 'alice1').sv, svBefore + 1, 'cookies on the lost device stop working');
   assert.equal((await srv.call('GET', '/api/me', { cookie: ALICE })).status, 401, 'the old cookie is dead');
   assert.equal((await srv.call('GET', '/api/me', { cookie: v.cookie })).data.user.id, 'alice1', 'the new one works');
@@ -201,7 +220,7 @@ test('an expired code is refused (bad); a live code issued the same way works (t
 });
 
 test('a code binds to its own user: the verify step ignores any user the client claims', async () => {
-  const code = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
+  const code = (await issue('bob1')).data.code;
   const aliceBefore = credsOf('alice1').length;
   const o = await srv.call('POST', '/api/recovery/options', { body: { code } });
   const auth = dev();
@@ -210,35 +229,35 @@ test('a code binds to its own user: the verify step ignores any user the client 
   assert.equal(v.status, 200);
   assert.equal(v.data.user.id, 'bob1');
   assert.equal(credsOf('alice1').length, aliceBefore);
-  assert.ok(credsOf('bob1').some(c => c.id === auth.id));
+  assert.deepEqual(credsOf('bob1').map(c => c.id), [auth.id]);
 });
 
 test('issuing a new code kills the previous one (bad); the new one works (twin)', async () => {
-  const first = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
-  const second = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
+  const first = (await issue('bob1')).data.code;
+  const second = (await issue('bob1')).data.code;
   assert.equal((await srv.call('POST', '/api/recovery/options', { body: { code: first } })).status, 400);
   assert.equal((await srv.call('POST', '/api/recovery/options', { body: { code: second } })).status, 200);
 });
 
 test('a revoked code is refused (bad); a fresh one after it works (twin)', async () => {
-  const code = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
+  const code = (await issue('bob1')).data.code;
   const bobNow = cookieFor('bob1', srv.db().users.find(u => u.id === 'bob1').sv || 0);
   assert.equal((await srv.call('GET', '/api/me', { cookie: bobNow })).status, 200, 'a live, non-admin session');
   assert.equal((await srv.call('POST', '/api/admin/recovery/revoke', { body: { id: 'bob1' }, cookie: bobNow })).status, 403);
   const rv = await srv.call('POST', '/api/admin/recovery/revoke', { body: { id: 'bob1' }, cookie: ADMIN });
   assert.equal(rv.status, 200);
   assert.equal((await srv.call('POST', '/api/recovery/options', { body: { code } })).status, 400);
-  const fresh = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
+  const fresh = (await issue('bob1')).data.code;
   assert.equal((await recover(fresh, dev())).status, 200);
 });
 
 test("a disabled account can't be recovered, and no code can be issued for it", async () => {
   assert.equal((await recover(FOR_EVE, dev())).status, 400);
-  assert.equal((await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'eve1' }, cookie: ADMIN })).status, 400);
+  assert.equal((await issue('eve1')).status, 400);
 });
 
 test('one code, two ceremonies started in parallel: only one of them gets in', async () => {
-  const code = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
+  const code = (await issue('bob1')).data.code;
   const [o1, o2] = await Promise.all([1, 2].map(() => srv.call('POST', '/api/recovery/options', { body: { code } })));
   const [a1, a2] = [dev(), dev()];
   const [v1, v2] = await Promise.all([
@@ -249,7 +268,7 @@ test('one code, two ceremonies started in parallel: only one of them gets in', a
 });
 
 test('a recovery ceremony from the wrong origin is refused and burns nothing', async () => {
-  const code = (await srv.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).data.code;
+  const code = (await issue('bob1')).data.code;
   const o = await srv.call('POST', '/api/recovery/options', { body: { code } });
   const bad = await srv.call('POST', '/api/recovery/verify', { body: { cid: o.data.cid, credential: dev().register(o.data.options, { origin: 'https://evil.example' }) } });
   assert.equal(bad.status, 400);
@@ -269,6 +288,8 @@ const DATA_ROUTES = [
   ['POST', '/api/push/unsubscribe', { endpoint: 'x' }], ['POST', '/api/push/test'], ['POST', '/api/push/rest-timer', { seconds: 60 }],
   ['POST', '/api/push/rest-timer/cancel'], ['POST', '/api/activity', { active: false }],
   ['POST', '/api/passkeys/options'], ['POST', '/api/passkeys/verify'],
+  ['POST', '/api/passkeys/stepup/options', { purpose: 'add' }], ['POST', '/api/passkeys/stepup/verify'],
+  ['GET', '/api/passkeys'], ['POST', '/api/passkeys/remove', { id: 'x' }], ['POST', '/api/notices/ack'],
   ['GET', '/api/admin/users'], ['GET', '/api/admin/user?id=alice1'], ['POST', '/api/admin/user/disable', { id: 'bob1' }],
   ['GET', '/api/admin/invites'], ['POST', '/api/admin/invites/new'], ['POST', '/api/admin/invites/revoke', { code: 'X' }],
   ['POST', '/api/admin/recovery/new', { id: 'bob1' }], ['POST', '/api/admin/recovery/revoke', { id: 'bob1' }],
@@ -345,9 +366,11 @@ test('recovery attempts are capped per IP (bad); another IP still gets through (
 test('add-passkey attempts are capped per user (bad); another user is unaffected (twin)', async () => {
   const s = await startServer({ db: seed(), env: { AUTH_LIMIT_IP: '100', AUTH_LIMIT_USER: '2' } });
   try {
-    for (let i = 0; i < 2; i++) assert.equal((await s.call('POST', '/api/passkeys/options', { body: {}, cookie: ALICE })).status, 200);
-    assert.equal((await s.call('POST', '/api/passkeys/options', { body: {}, cookie: ALICE })).status, 429);
-    assert.equal((await s.call('POST', '/api/passkeys/options', { body: {}, cookie: BOB })).status, 200);
+    const so = ck => s.call('POST', '/api/passkeys/stepup/options', { body: { purpose: 'add' }, cookie: ck });
+    for (let i = 0; i < 2; i++) assert.equal((await so(ALICE)).status, 200);
+    assert.equal((await so(ALICE)).status, 429);
+    assert.equal((await so(BOB)).status, 200);
+    assert.equal((await s.call('POST', '/api/passkeys/options', { body: {}, cookie: ALICE })).status, 429, 'the add route shares the budget');
   } finally { await s.stop(); }
 });
 
@@ -366,7 +389,7 @@ test('recovery attempts on one account are capped per user, whichever IP they co
 test('issuing recovery codes is capped too', async () => {
   const s = await startServer({ db: seed(), env: { AUTH_LIMIT_IP: '100', AUTH_LIMIT_USER: '2' } });
   try {
-    for (let i = 0; i < 2; i++) assert.equal((await s.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).status, 200);
-    assert.equal((await s.call('POST', '/api/admin/recovery/new', { body: { id: 'bob1' }, cookie: ADMIN })).status, 429);
+    for (let i = 0; i < 2; i++) assert.equal((await issue('bob1', { server: s })).status, 200);
+    assert.equal((await issue('bob1', { server: s })).status, 429);
   } finally { await s.stop(); }
 });
