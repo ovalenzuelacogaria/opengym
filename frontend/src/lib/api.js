@@ -51,6 +51,24 @@ export async function passkeyRegister(name, code) {
   const res = await api('/api/register/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
   return res.user
 }
+// Another passkey on the signed-in profile. The browser's own dialog
+// offers "this device" or another one (a phone over QR, a security key), so this one call covers both.
+export async function passkeyAdd() {
+  const { cid, options } = await api('/api/passkeys/options', { method: 'POST', body: '{}' })
+  const cred = await navigator.credentials.create({ publicKey: toCreationOptions(options) })
+  return api('/api/passkeys/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
+}
+// Recovery with an admin-issued code, in two steps so that the passkey prompt (step 2) runs
+// straight from a tap — Safari only shows it inside a user gesture.
+export async function recoveryCheck(code) {
+  return api('/api/recovery/options', { method: 'POST', body: JSON.stringify({ code }) })   // { cid, options, name }
+}
+export async function recoveryFinish({ cid, options }) {
+  // A copy: toCreationOptions converts in place, and a cancelled prompt may be retried.
+  const cred = await navigator.credentials.create({ publicKey: toCreationOptions(structuredClone(options)) })
+  const res = await api('/api/recovery/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
+  return res.user
+}
 export async function passkeyLogin() {
   const { cid, options } = await api('/api/login/options', { method: 'POST', body: '{}' })
   const cred = await navigator.credentials.get({ publicKey: toRequestOptions(options) })

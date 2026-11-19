@@ -9,6 +9,7 @@ import { confirmSheet } from '../sheets.jsx'
 import Icon from '../components/Icon.jsx'
 import { Button } from '../components/ui.jsx'
 import AdminCoach from './AdminCoach.jsx'
+import { t, dateLocale } from '../lib/i18n.js'
 
 // Admin-only operator dashboard (owner passkey + admin flag; guarded again server-side).
 // Deliberately English-only — it isn't part of the translated end-user surface, so it stays
@@ -53,6 +54,7 @@ function UserDetail({ id, onChanged, close }) {
       onClick={() => u.disabled ? setDisabled(false)
         : confirmSheet({ title: 'Disable ' + u.name + '?', message: 'They are signed out everywhere and can no longer sync or log in until re-enabled.', confirmText: 'Disable', danger: true, onConfirm: () => setDisabled(true) })}>
       {u.disabled ? 'Enable account' : 'Disable account'}</button>}
+    {!u.disabled && <RecoveryCard user={u} passkeys={d.passkeys} pending={d.recovery} />}
     <h4 className="sec">Workout history</h4>
     {d.workouts.length ? <div className="list" style={{ gap: 0 }}>
       {d.workouts.slice(0, 60).map(w => <div key={w.id} className="row between" style={{ padding: '9px 2px', borderBottom: '1px solid var(--sep)' }}>
@@ -61,6 +63,48 @@ function UserDetail({ id, onChanged, close }) {
         <span className="small muted">{fmtVol(w.vol ?? workoutVolume(w), d.unit)}</span>
       </div>)}
     </div> : <div className="empty small">No workouts logged.</div>}
+  </>
+}
+
+// Give someone who lost their device a way back in. The code is shown
+// here once and never again (the server keeps only a hash); hand it over in person or on a
+// channel you trust. Unlike the rest of this dashboard these strings are translated (es, en at least).
+function RecoveryCard({ user, passkeys, pending: initial }) {
+  const toast = useUI(s => s.toast)
+  const [pending, setPending] = useState(initial)
+  const [issued, setIssued] = useState(null)   // { code, exp } — only in memory, only now
+  const when = ms => new Date(ms).toLocaleString(dateLocale(), { dateStyle: 'medium', timeStyle: 'short' })
+  const issue = () => api('/api/admin/recovery/new', { method: 'POST', body: JSON.stringify({ id: user.id }) })
+    .then(r => { setIssued({ code: r.code, exp: r.exp }); setPending({ exp: r.exp }) })
+    .catch(e => toast(e.status === 429 ? t('Too many attempts — wait a few minutes and try again.') : e.message))
+  const revoke = () => api('/api/admin/recovery/revoke', { method: 'POST', body: JSON.stringify({ id: user.id }) })
+    .then(() => { setIssued(null); setPending(null); toast(t('Recovery code revoked')) })
+    .catch(e => toast(e.message))
+  const copy = () => navigator.clipboard?.writeText(issued.code).then(() => toast(t('Copied'))).catch(() => {})
+  return <>
+    <h4 className="sec">{t('Access')}</h4>
+    <div className="small muted" style={{ marginBottom: 8 }}>{t('Passkeys: {0}', passkeys ?? '—')}</div>
+    {issued ? <div className="card" style={{ textAlign: 'center' }}>
+      <div className="dim small">{t('Recovery code for {0}', user.name)}</div>
+      <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: '1.15rem', fontWeight: 700, letterSpacing: '.06em', margin: '8px 0', userSelect: 'all', overflowWrap: 'anywhere' }}>{issued.code}</div>
+      <div className="dim small">{t('Works once, until {0}. It will not be shown again.', when(issued.exp))}</div>
+      <div className="row" style={{ gap: 8, justifyContent: 'center', marginTop: 10 }}>
+        <Button size="sm" onClick={copy}>{t('Copy')}</Button>
+        <Button size="sm" variant="danger" onClick={revoke}>{t('Revoke')}</Button>
+      </div>
+    </div> : <>
+      <div className="dim small" style={{ marginBottom: 8 }}>{pending
+        ? t('A recovery code is pending until {0}.', when(pending.exp))
+        : t('Lost device? Generate a one-time recovery code and give it to them in person. On a new device they choose “Recover access with a code”.')}</div>
+      <div className="row" style={{ gap: 8 }}>
+        <Button size="sm" icon="key" onClick={() => confirmSheet({
+          title: t('Recovery code for {0}?', user.name),
+          message: t('Whoever has the code can add a passkey to this profile, once, before it expires. Any earlier code stops working, and the profile is signed out on all devices when it is used.'),
+          confirmText: t('Generate'), onConfirm: issue
+        })}>{pending ? t('New recovery code') : t('Generate recovery code')}</Button>
+        {pending && <Button size="sm" variant="danger" onClick={revoke}>{t('Revoke')}</Button>}
+      </div>
+    </>}
   </>
 }
 

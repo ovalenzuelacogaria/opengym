@@ -121,17 +121,28 @@ Read this before hosting openGym for anyone other than yourself.
   `requireUserVerification: false` (`api/server.js:297`, `api/server.js:343`), so a passkey
   released without a biometric or PIN is still accepted. In practice: unlocked device ≈ account
   access.
-- **One passkey per profile, and no recovery.** Every successful registration creates a *new*
-  profile (`api/server.js:309-319`); there is no route to attach a second passkey to an existing
-  one, and no email or reset path. Lose the passkey and that profile is unreachable — only direct
-  surgery on `./data` gets it back.
+- **More passkeys and recovery go through a session or an admin.** Sign-up still creates a *new*
+  profile each time. A signed-in user can add passkeys to their own profile from Settings
+  (`POST /api/passkeys/*`, user verification required). Someone who lost every device gets back in
+  only with a one-time code an admin issues from the dashboard (`POST /api/admin/recovery/new`):
+  bound to one user, stored as an HMAC under `./data/secret`, compared in constant time, valid
+  `RECOVERY_HOURS` (24 by default), revoked by the next one, and burned when the new passkey is
+  verified, which also signs the profile out everywhere. The code is a bearer secret: whoever holds
+  it can add a passkey to that profile until it is used or expires — hand it over in person. Old
+  passkeys are not removed by a recovery. There is still no email or self-service reset.
+  Events (issued, used, refused, revoked, rate-limited, passkey added) go to `db.json` `authLog`
+  and the api log, without the code.
 - **Disabling someone isn't a ban.** They can still register a fresh profile with a new passkey
   unless `INVITE_ONLY=1` is set.
 - **HTTPS is required and the app doesn't provide it.** The API container speaks plain HTTP and
   nginx listens on `:80` (`web/nginx.conf`); TLS is your reverse proxy's job. Without it,
   browsers won't do passkeys at all (except on `http://localhost`) and the session cookie is sent
   in the clear.
-- **No rate limiting anywhere.** Nothing throttles logins, registrations or writes, and
+- **Rate limiting only on the passkey-add and recovery routes.** Those are capped per client IP
+  and per user (`AUTH_LIMIT_*`, in memory, reset on restart); the IP comes from
+  `X-Forwarded-For` through `TRUST_PROXY_HOPS` trusted proxies, so set it to match your setup or
+  the per-IP cap counts the proxy, or a client can choose its own address. Nothing else throttles
+  logins, registrations or writes, and
   `POST /api/register/options` still answers whether an invite code is valid
   (`api/server.js:272`), so an invite-only instance on the open internet should have a rate limit
   in front of it. New invite codes are 16 hex characters — 64 bits (`api/server.js:525`) — which
@@ -140,10 +151,17 @@ Read this before hosting openGym for anyone other than yourself.
   hard limit
   in the app is a 5 MB request body (`api/server.js:27`).
 - **A few endpoints answer without a session:** `/api/health` (which includes the total user
-  count), `/api/config` (whether invite-only is on), `/api/push/public-key`, and the
-  register/login handshakes.
+  count), `/api/config` (whether invite-only and guest mode are on), `/api/push/public-key`, the
+  register/login handshakes and the recovery handshake. With `GUEST_MODE=0` the server denies by
+  default: only health, config, the register/login/recovery handshakes and logout answer without
+  a session; everything else, including routes added later, is 401 before its handler runs. The
+  static app bundle is still served to anyone (it holds code, not data).
 - **Changing `RP_ID` invalidates every existing passkey.** They were bound to the old hostname
   and will fail verification against the new one. The data stays on disk but is unreachable until
   each user registers again — as a *new* profile. Choose your hostname before anyone registers.
 - **Guest mode never reaches the backend.** That data lives unencrypted in the browser's
-  `localStorage` and is gone when the browser storage is cleared.
+  `localStorage` and is gone when the browser storage is cleared. `GUEST_MODE=0` removes it: the
+  app draws nothing past the sign-in screen until `/api/me` confirms a session in that load (a
+  profile cached in `localStorage` is not enough), so it also needs the server to be reachable.
+  A device that signed in before still keeps its last synced copy in `localStorage`; it is not
+  drawn without a session, but it is not wiped either.

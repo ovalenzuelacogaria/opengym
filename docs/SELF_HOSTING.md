@@ -104,6 +104,13 @@ out and locked out everywhere until you re-enable it), and — with `INVITE_ONLY
 revoking invite codes. Existing accounts keep working when you switch invite-only on. Admin access
 is gated by your passkey and enforced server-side, so it needs no separate login.
 
+Each user can add passkeys for more devices in **Settings → Add a passkey on this or another
+device** (the browser offers this device, a phone over QR or a security key). If someone loses
+every device, open them in the admin dashboard and **Generate recovery code**: a one-time code,
+valid 24 h (`RECOVERY_HOURS`), shown only once — give it to them in person. On the new device they
+pick **Recover access with a code** on the sign-in screen. Set `GUEST_MODE=0` to drop "Continue
+without account" so nothing in the app is reachable without signing in.
+
 Prefer to keep the whole thing off the open internet? A VPN or an auth proxy (Authelia, Cloudflare
 Access…) in front still works, and composes with the above.
 

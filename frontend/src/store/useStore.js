@@ -4,6 +4,7 @@ import { localTZ } from '../lib/format.js'
 import { registerCustom } from '../lib/exercises.js'
 import { DEMO, DEMO_SEEDED } from '../lib/demo.js'
 import { MOBILE, nativeLoad, nativeSave, syncReminder } from '../lib/mobile.js'
+import { LOCK_KEY, lockedFrom, canEnter, mustWait } from '../lib/gate.js'
 
 const KEY = 'gym_state_v1'
 export const DEF = {
@@ -100,13 +101,23 @@ export const useStore = create((set, get) => {
     },
     replaceState(S, push = false) { persist(clone(S), push) },
 
-    isGuest: () => localStorage.getItem('gym_guest') === '1',
-    setGuest(v) { if (v) localStorage.setItem('gym_guest', '1'); else localStorage.removeItem('gym_guest'); set({}) },
+    // Sign-in gate (lib/gate.js). sessionOk: the server confirmed a session during this load.
+    sessionOk: false,
+    locked: () => !DEMO && !MOBILE && lockedFrom(get().config, localStorage.getItem(LOCK_KEY)),
+    isGuest: () => !get().locked() && localStorage.getItem('gym_guest') === '1',
+    canEnter: () => canEnter({ locked: get().locked(), user: get().user, sessionOk: get().sessionOk, guest: get().isGuest() }),
+    gateWaiting: () => mustWait({ ready: get().ready, cached: localStorage.getItem(LOCK_KEY), demo: DEMO, mobile: MOBILE }),
+    setGuest(v) {
+      if (v && get().locked()) return   // GUEST_MODE=0: there is no guest profile to enter
+      if (v) localStorage.setItem('gym_guest', '1'); else localStorage.removeItem('gym_guest'); set({})
+    },
 
+    // Every caller hands in a user the server just vouched for (sign-in, sign-up, recovery,
+    // /api/me), so a user here is a confirmed session; null ends it.
     setUser(u) {
       if (u) { localStorage.setItem('gym_user', JSON.stringify(u)); localStorage.removeItem('gym_guest') }
       else localStorage.removeItem('gym_user')
-      set({ user: u })
+      set({ user: u, sessionOk: !!u })
     },
 
     async pushState() {
@@ -182,6 +193,9 @@ export const useStore = create((set, get) => {
       }
       // Instance capabilities are public and needed whether or not anyone is signed in.
       try { set({ config: await api('/api/config') }) } catch (e) { /* offline — assume nothing extra */ }
+      // Remember whether this instance is closed to guests, so the next load knows before it asks.
+      if (get().config) localStorage.setItem(LOCK_KEY, get().config.guest_mode === false ? '1' : '0')
+      if (get().locked()) localStorage.removeItem('gym_guest')
       try {
         const me = await api('/api/me')
         get().setUser(me.user)

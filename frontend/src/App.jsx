@@ -42,7 +42,10 @@ function Shell() {
   const navigate = useNavigate()
   const loc = useLocation()
   const { S, user, ready } = useStore()
-  const isGuest = useStore(s => s.isGuest())
+  // Sign-in gate (lib/gate.js): on a GUEST_MODE=0 instance only a session the server confirmed
+  // in this load gets past Login; otherwise a signed-in profile or a guest, as always.
+  const authed = useStore(s => s.canEnter())
+  const waiting = useStore(s => s.gateWaiting())
   const langV = useLang()   // re-renders the whole shell when the language (pack) changes
   useEffect(() => { setNav(navigate) }, [navigate])
   useEffect(() => { applyPrefs(S.theme, S.accent) }, [S.theme, S.accent])
@@ -53,8 +56,7 @@ function Shell() {
   // bound to the workout, not to the route — checking Stats mid-session keeps the screen on
   useWakeLock(!!S.active && S.keepAwake !== false)
 
-  const authed = user || isGuest
-  if (!ready && !authed) return (
+  if (waiting || (!ready && !authed)) return (
     <div id="app">
       <div style={{ paddingTop: '44vh', display: 'flex', justifyContent: 'center', fontSize: 34, color: 'var(--label-3)' }}>
         <Icon name="dumbbell" />

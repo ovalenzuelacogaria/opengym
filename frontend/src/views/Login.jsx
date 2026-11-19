@@ -1,7 +1,7 @@
 import { useStore } from '../store/useStore.js'
 import { useUI } from '../store/useUI.js'
-import { webauthnOK, passkeyLogin, passkeyRegister, api, BIO } from '../lib/api.js'
-import { hasData } from '../store/useStore.js'
+import { webauthnOK, passkeyLogin, passkeyRegister, recoveryCheck, recoveryFinish, api, BIO } from '../lib/api.js'
+import { hasData, DEF } from '../store/useStore.js'
 import { t } from '../lib/i18n.js'
 import { DEMO, REPO } from '../lib/demo.js'
 import { useState, useRef, useEffect } from 'react'
@@ -42,8 +42,68 @@ function RegisterSheet({ close }) {
   </>
 }
 
+// Back in after losing the device, with a one-time code from the admin.
+// Two taps on purpose: the first checks the code, the second runs the passkey prompt straight
+// from the tap (Safari only shows it inside a user gesture) and names the account it is for.
+function RecoverSheet({ close }) {
+  const { setUser, pullState, replaceState } = useStore()
+  const [code, setCode] = useState('')
+  const [found, setFound] = useState(null)   // { cid, options, name } once the code checks out
+  const [busy, setBusy] = useState(false)
+  // Errors show inside the sheet: a toast would sit behind it, where nobody reads it.
+  const [err, setErr] = useState('')
+  const ref = useRef(null)
+  useEffect(() => { setTimeout(() => ref.current?.focus(), 250) }, [])
+  const toast = m => useUI.getState().toast(m)
+  const explain = e => e.status === 429 ? t('Too many attempts — wait a few minutes and try again.')
+    : e.status === 400 ? t('This code is not valid or has expired — ask the admin for a new one.')
+    : (e.message || t('Recovery failed'))
+  const check = async () => {
+    if (!code.trim()) { setErr(t('Enter the recovery code')); return }
+    setBusy(true); setErr('')
+    try { setFound(await recoveryCheck(code.trim())) } catch (e) { setErr(explain(e)) }
+    setBusy(false)
+  }
+  const finish = async () => {
+    setBusy(true); setErr('')
+    try {
+      const u = await recoveryFinish(found)
+      // The account's own data is the one that counts on a recovered device, not whatever
+      // this browser had lying around.
+      replaceState(JSON.parse(JSON.stringify(DEF)), false)
+      setUser(u); close()
+      await pullState()
+      toast(t('Access restored — welcome back, {0}', u.name))
+    } catch (e) {
+      if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') {
+        setErr(explain(e))
+        if (e.status === 400 || e.status === 429) setFound(null)   // that ceremony is spent: start over
+      }
+    }
+    setBusy(false)
+  }
+  if (found) return <>
+    <h3>{t('Recover access')}</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>{t('Code accepted for {0}. Now create a passkey on this device — confirm with {1}.', found.name, BIO)}</div>
+    <Button variant="primary" icon="key" disabled={busy} onClick={finish}>{t('Create passkey')}</Button>
+    {err && <div role="alert" className="small" style={{ color: 'var(--red)', marginTop: 10 }}>{err}</div>}
+  </>
+  return <>
+    <h3>{t('Recover access')}</h3>
+    <div className="muted small" style={{ marginBottom: 14 }}>{t('Lost your device? Ask the admin for a recovery code. It works once and expires.')}</div>
+    <input ref={ref} className="input" placeholder={t('Recovery code')} maxLength={40} value={code} autoComplete="one-time-code"
+      onChange={e => setCode(e.target.value.toUpperCase())} onKeyDown={e => { if (e.key === 'Enter') check() }}
+      style={{ letterSpacing: '.1em', fontWeight: 600, textAlign: 'center' }} />
+    <div style={{ height: 12 }} />
+    <Button variant="primary" disabled={busy} onClick={check}>{t('Continue')}</Button>
+    {err && <div role="alert" className="small" style={{ color: 'var(--red)', marginTop: 10 }}>{err}</div>}
+  </>
+}
+
 export default function Login() {
   const { setUser, pullState, setGuest } = useStore()
+  // GUEST_MODE=0 on the server: no way in without a profile.
+  const locked = useStore(s => s.locked())
   const signIn = async () => {
     try { const u = await passkeyLogin(); setUser(u); await pullState(); useUI.getState().toast(t('Welcome back, {0}', u.name)) }
     catch (e) { if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') useUI.getState().toast(e.message || t('Sign-in failed')) }
@@ -78,8 +138,12 @@ export default function Login() {
         <div style={{ height: 10 }} />
         <Button icon="sparkles" onClick={() => useUI.getState().openSheet(close => <RegisterSheet close={close} />)}>{t('Create new profile')}</Button>
         <div style={{ height: 10 }} />
-      </> : <div className="card small muted" style={{ textAlign: 'left' }}>{t("This browser doesn't support passkeys — you can still use openGym locally on this device.")}</div>}
-      <Button variant="ghost" className="dim" onClick={() => setGuest(true)}>{t('Continue without account')}</Button>
+        <Button variant="ghost" icon="key" onClick={() => useUI.getState().openSheet(close => <RecoverSheet close={close} />)}>{t('Recover access with a code')}</Button>
+        <div style={{ height: 10 }} />
+      </> : <div className="card small muted" style={{ textAlign: 'left' }}>{locked
+        ? t("This browser doesn't support passkeys, and this openGym needs a profile to sign in. Try Safari, Chrome or Edge.")
+        : t("This browser doesn't support passkeys — you can still use openGym locally on this device.")}</div>}
+      {!locked && <Button variant="ghost" className="dim" onClick={() => setGuest(true)}>{t('Continue without account')}</Button>}
       <div className="dim small" style={{ marginTop: 26, lineHeight: 1.5 }}>{t('Passkeys use {0} — no passwords.', BIO)}<br />{t('Each profile keeps its own plan, workouts & body weight.')}</div>
     </div>
   )

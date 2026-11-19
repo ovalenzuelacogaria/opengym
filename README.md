@@ -170,6 +170,11 @@ All via `.env` (see `.env.example`):
 | `ADMIN_UIDS`  | User ids that get the admin dashboard (comma-separated) | *(none)*             |
 | `INVITE_ONLY` | Require an invite code to create a profile           | *(off)*                 |
 | `COACH_DISABLED` | Force the AI Coach off, whatever the admin dashboard says | *(unset)*        |
+| `GUEST_MODE`  | `0` = no "continue without account": the app and every data route need a session | *(on)* |
+| `RECOVERY_HOURS` | How long an admin-issued recovery code stays valid (1-72) | `24`              |
+| `AUTH_LIMIT_IP` / `AUTH_LIMIT_USER` | Attempts per window on the add-passkey and recovery routes, per IP / per user | `20` / `10` |
+| `AUTH_LIMIT_WINDOW_MIN` | Length of that window, in minutes                | `15`                    |
+| `TRUST_PROXY_HOPS` | Reverse proxies in front of the api (nginx = 1; another proxy in front of nginx = 2) | `1` |
 
 Push notification keys are generated on first run and saved to `./data/vapid.json` — nothing to set.
 

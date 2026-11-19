@@ -13,6 +13,7 @@ import * as coachConfig from './coach/config.js';
 import * as coachJobs from './coach/jobs.js';
 import { coachRoutes } from './coach/routes.js';
 import { startCadence } from './coach/cadence.js';
+import { rateLimiter, clientIp, newRecoveryCode, hashCode, findRecovery, activeRecovery } from './account.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
@@ -28,6 +29,17 @@ const INVITE_ONLY = /^(1|true|yes|on)$/i.test(process.env.INVITE_ONLY || '');
 // internet don't want the same number. Only affects cookies minted from now on — the expiry is
 // baked into each cookie when it's issued, so lowering this never cuts an existing session short.
 const SESSION_DAYS = Math.max(1, +(process.env.SESSION_DAYS || 90) || 90);
+// GUEST_MODE=0 tells the app there is no way in without a session: no
+// "continue without account", no local-only guest profile. On by default, as in the original.
+const GUEST_MODE = !/^(0|false|no|off)$/i.test(process.env.GUEST_MODE || '');
+// How long an admin-issued recovery code stays good, unless the admin asks for another span (1-72 h).
+const RECOVERY_HOURS = Math.min(72, Math.max(1, +(process.env.RECOVERY_HOURS || 24) || 24));
+// Attempts allowed per window on the passkey-add and recovery routes, per client IP and per user.
+// The IP is read through TRUST_PROXY_HOPS reverse proxies (nginx alone = 1, Traefik + nginx = 2).
+const AUTH_LIMIT_IP = Math.max(1, +(process.env.AUTH_LIMIT_IP || 20) || 20);
+const AUTH_LIMIT_USER = Math.max(1, +(process.env.AUTH_LIMIT_USER || 10) || 10);
+const AUTH_LIMIT_WINDOW_MS = Math.max(1, +(process.env.AUTH_LIMIT_WINDOW_MIN || 15) || 15) * 60000;
+const TRUST_PROXY_HOPS = Math.max(0, Math.floor(+(process.env.TRUST_PROXY_HOPS ?? 1) || 0));
 const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
@@ -49,6 +61,8 @@ let db = { users: [], creds: [], subs: [], invites: [] };
 try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
 db.subs = db.subs || [];
 db.invites = db.invites || [];
+db.recovery = db.recovery || [];   // admin-issued recovery codes, stored as HMACs only
+db.authLog = db.authLog || [];     // account-access events (never a code, key or cookie)
 const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
 function atomicWrite(file, content) {
@@ -227,6 +241,77 @@ function takeChallenge(cid) {
 }
 setInterval(() => { for (const [k, v] of challenges) if (v.exp < Date.now()) challenges.delete(k); }, 60000).unref();
 
+/* ---------- account access: rate limits + event log ---------- */
+// One pair of limiters (per IP, per user) for each family of new routes. A family counts every
+// attempt, good or bad: the point is to cap guessing and hammering, not only failures.
+const limiterPair = () => ({
+  ip: rateLimiter({ max: AUTH_LIMIT_IP, windowMs: AUTH_LIMIT_WINDOW_MS }),
+  user: rateLimiter({ max: AUTH_LIMIT_USER, windowMs: AUTH_LIMIT_WINDOW_MS })
+});
+const limits = { passkey: limiterPair(), recovery: limiterPair(), adminRecovery: limiterPair() };
+setInterval(() => { for (const p of Object.values(limits)) { p.ip.sweep(); p.user.sweep(); } }, 60000).unref();
+// Counts one attempt against `kind` ('ip' or 'user') and answers 429 when it is over the limit.
+// Returns true when the request was refused (the caller just returns).
+function overLimit(req, res, family, kind, key) {
+  const r = limits[family][kind].hit(kind + ':' + key);
+  if (r.ok) return false;
+  // Logged once per key and window, and written with the next save: a flood of refused requests
+  // must not turn into a flood of log lines and disk writes.
+  if (r.first) authEvent('rate-limited', { family, kind, ip: clientIp(req, TRUST_PROXY_HOPS), ...(kind === 'user' ? { userId: key } : {}) });
+  json(res, 429, { error: 'too many attempts — try again later' }, { 'Retry-After': String(r.retryAfter) });
+  return true;
+}
+// Persistent, capped record of who did what to whose access. Fields are ids, times and IPs; the
+// caller never passes a code, key or cookie. Also printed as one JSON line for `docker logs`.
+function authEvent(type, fields) {
+  const e = { at: new Date().toISOString(), type, ...fields };
+  db.authLog.push(e);
+  if (db.authLog.length > 500) db.authLog.splice(0, db.authLog.length - 500);
+  console.log('auth-event ' + JSON.stringify(e));
+}
+const credsOf = uid => db.creds.filter(c => c.userId === uid);
+const BAD_CODE = 'invalid or expired recovery code';
+
+// Registration options for a passkey on an EXISTING profile (add or recover). Same user handle
+// as the original sign-up (Buffer.from(uid)), the user's current passkeys excluded, UV required.
+// @simplewebauthn/server 13.3.2: generateRegistrationOptions({ userID: Uint8Array, excludeCredentials: [{ id, transports }] }).
+function registrationOptionsFor(user) {
+  return generateRegistrationOptions({
+    rpName: RP_NAME, rpID: RP_ID,
+    userID: Buffer.from(user.id), userName: user.name, userDisplayName: user.name,
+    attestationType: 'none',
+    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
+    excludeCredentials: credsOf(user.id).map(c => ({ id: c.id, transports: c.transports }))
+  });
+}
+// Verifies a registration response against a stored challenge; answers 400 itself and returns
+// null when it doesn't hold. requireUserVerification: true (13.3.2 default) — the UV flag must be set.
+async function verifyNewCredential(res, body, c) {
+  let verification;
+  try {
+    verification = await verifyRegistrationResponse({
+      response: body.credential,
+      expectedChallenge: c.challenge,
+      expectedOrigin: ORIGIN,
+      expectedRPID: RP_ID,
+      requireUserVerification: true
+    });
+  } catch (e) { json(res, 400, { error: 'verification failed: ' + e.message }); return null; }
+  if (!verification.verified) { json(res, 400, { error: 'not verified' }); return null; }
+  return verification.registrationInfo.credential;
+}
+function storeCredential(user, credential, body, via) {
+  db.creds.push({
+    id: credential.id, userId: user.id,
+    publicKey: Buffer.from(credential.publicKey).toString('base64url'),
+    counter: credential.counter || 0,
+    // Client-supplied and later echoed back in options: keep only short strings.
+    transports: (Array.isArray(body.credential?.response?.transports) ? body.credential.response.transports : [])
+      .filter(t => typeof t === 'string' && t.length <= 20).slice(0, 8),
+    created: new Date().toISOString(), via
+  });
+}
+
 /* ---------- helpers ---------- */
 function json(res, code, obj, extraHeaders) {
   const body = JSON.stringify(obj);
@@ -273,7 +358,7 @@ const routes = {
   // the app it was before the feature existed.
   'GET /api/config': async (req, res) => {
     const coach = coachConfig.publicConfig();
-    json(res, 200, { invite_only: INVITE_ONLY, ...(coach ? { coach } : {}) });
+    json(res, 200, { invite_only: INVITE_ONLY, guest_mode: GUEST_MODE, ...(coach ? { coach } : {}) });
   },
 
   'GET /api/me': async (req, res) => {
@@ -297,14 +382,16 @@ const routes = {
       authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
       excludeCredentials: []
     });
-    const cid = putChallenge({ challenge: options.challenge, name, uid, code });
+    const cid = putChallenge({ purpose: 'register', challenge: options.challenge, name, uid, code });
     json(res, 200, { cid, options });
   },
 
   'POST /api/register/verify': async (req, res) => {
     const body = await readBody(req);
     const c = takeChallenge(body.cid);
-    if (!c || !c.uid) return json(res, 400, { error: 'challenge expired — try again' });
+    // Challenges carry their purpose: an add-passkey or recovery challenge also holds an existing
+    // uid, and finishing one here would push a second user row with that id.
+    if (!c || !c.uid || c.purpose !== 'register') return json(res, 400, { error: 'challenge expired — try again' });
     let verification;
     try {
       verification = await verifyRegistrationResponse({
@@ -341,14 +428,14 @@ const routes = {
     const options = await generateAuthenticationOptions({
       rpID: RP_ID, userVerification: 'preferred', allowCredentials: []
     });
-    const cid = putChallenge({ challenge: options.challenge });
+    const cid = putChallenge({ purpose: 'login', challenge: options.challenge });
     json(res, 200, { cid, options });
   },
 
   'POST /api/login/verify': async (req, res) => {
     const body = await readBody(req);
     const c = takeChallenge(body.cid);
-    if (!c) return json(res, 400, { error: 'challenge expired — try again' });
+    if (!c || c.purpose !== 'login') return json(res, 400, { error: 'challenge expired — try again' });
     const cred = db.creds.find(x => x.id === body.credential?.id);
     if (!cred) return json(res, 404, { error: 'unknown passkey — create a profile first' });
     let verification;
@@ -388,6 +475,89 @@ const routes = {
     user.sv = sessionVersion(user) + 1;
     saveDb();
     json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
+  },
+
+  /* ---------- more passkeys on the same profile ---------- */
+  // Signed-in only. The new credential is created under the SAME user handle as the profile, so
+  // sign-in on the new device resolves to the same user; passkeys already on file are excluded,
+  // so an authenticator that has one isn't asked to make a duplicate. User verification is
+  // required here (not just preferred): adding a key is a change to who can get in.
+  'POST /api/passkeys/options': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    if (overLimit(req, res, 'passkey', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    if (overLimit(req, res, 'passkey', 'user', user.id)) return;
+    const options = await registrationOptionsFor(user);
+    const cid = putChallenge({ purpose: 'add', challenge: options.challenge, uid: user.id, sv: sessionVersion(user) });
+    json(res, 200, { cid, options });
+  },
+
+  'POST /api/passkeys/verify': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    if (overLimit(req, res, 'passkey', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    if (overLimit(req, res, 'passkey', 'user', user.id)) return;
+    const body = await readBody(req);
+    const c = takeChallenge(body.cid);
+    if (!c || c.purpose !== 'add') return json(res, 400, { error: 'challenge expired — try again' });
+    // The ceremony belongs to the session that started it, and only while that session lives.
+    if (c.uid !== user.id || c.sv !== sessionVersion(user)) return json(res, 403, { error: 'forbidden' });
+    const credential = await verifyNewCredential(res, body, c);
+    if (!credential) return;
+    // Re-check after the await: the account may have been disabled or signed out meanwhile.
+    if (user.disabled || sessionVersion(user) !== c.sv || !db.users.includes(user)) return json(res, 403, { error: 'forbidden' });
+    if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
+    storeCredential(user, credential, body, 'add');
+    authEvent('passkey.added', { userId: user.id, credId: credential.id.slice(0, 12), ip: clientIp(req, TRUST_PROXY_HOPS) });
+    saveDb();
+    json(res, 200, { ok: true, passkeys: credsOf(user.id).length });
+  },
+
+  /* ---------- recovery with an admin-issued, one-time code ---------- */
+  // No session: this is how someone who lost their device gets back in. The code names the
+  // account (it is bound to one user when issued); nothing the client sends can point it at
+  // another. It is burned only when a new passkey has actually been verified.
+  'POST /api/recovery/options': async (req, res) => {
+    if (overLimit(req, res, 'recovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    const body = await readBody(req);
+    const found = findRecovery(db.recovery, SECRET, body.code);
+    const user = found.ok ? db.users.find(u => u.id === found.record.userId) : null;
+    if (!found.ok || !user || user.disabled) {
+      // A known code that can't be used is worth a line in the log; a random guess is not.
+      if (found.record) {
+        authEvent('recovery.refused', { userId: found.record.userId, reason: found.ok ? 'account' : found.reason, ip: clientIp(req, TRUST_PROXY_HOPS) });
+        saveDb();
+      }
+      return json(res, 400, { error: BAD_CODE });
+    }
+    if (overLimit(req, res, 'recovery', 'user', user.id)) return;
+    const options = await registrationOptionsFor(user);
+    const cid = putChallenge({ purpose: 'recover', challenge: options.challenge, uid: user.id, recId: found.record.id });
+    json(res, 200, { cid, options, name: user.name });
+  },
+
+  'POST /api/recovery/verify': async (req, res) => {
+    if (overLimit(req, res, 'recovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    const body = await readBody(req);
+    const c = takeChallenge(body.cid);
+    if (!c || c.purpose !== 'recover') return json(res, 400, { error: 'challenge expired — try again' });
+    if (overLimit(req, res, 'recovery', 'user', c.uid)) return;
+    const credential = await verifyNewCredential(res, body, c);
+    if (!credential) return;
+    // Everything from here to saveDb() is synchronous, so two ceremonies racing on one code
+    // can't both see it unused: the first marks it, the second finds it marked.
+    const rec = db.recovery.find(r => r.id === c.recId);
+    const user = db.users.find(u => u.id === c.uid);
+    if (!rec || rec.userId !== c.uid || rec.usedAt || rec.revokedAt || !(rec.exp > Date.now()) || !user || user.disabled)
+      return json(res, 400, { error: BAD_CODE });
+    if (db.creds.find(x => x.id === credential.id)) return json(res, 409, { error: 'credential already registered' });
+    rec.usedAt = new Date().toISOString();
+    storeCredential(user, credential, body, 'recovery');
+    // Whoever has the lost device keeps its cookie until expiry otherwise: end every session.
+    user.sv = sessionVersion(user) + 1;
+    authEvent('recovery.used', { userId: user.id, recId: rec.id, credId: credential.id.slice(0, 12), ip: clientIp(req, TRUST_PROXY_HOPS) });
+    saveDb();
+    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
   },
 
   'GET /api/data': async (req, res) => {
@@ -488,6 +658,7 @@ const routes = {
         lastWorkout: last ? last.d : null,
         lastSync: S._ts || null,
         hasPush: db.subs.some(s => s.userId === u.id),
+        passkeys: credsOf(u.id).length,
         live: livePresence(u.id)
       };
     });
@@ -503,6 +674,8 @@ const routes = {
     const S = readState(u.id) || {};
     json(res, 200, {
       user: { id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null },
+      passkeys: credsOf(u.id).length,
+      recovery: activeRecovery(db.recovery, u.id),   // { id, created, exp } or null — never the hash
       unit: S.unit || 'kg',
       lastSync: S._ts || null,
       routines: (S.routines || []).map(r => ({ id: r.id, name: r.name, emoji: r.emoji, count: (r.ex || []).length })),
@@ -558,12 +731,56 @@ const routes = {
     json(res, 200, { ok: true });
   },
 
+  // Recovery code for a user who lost their passkey. Shown to the admin
+  // once, in this response; stored as an HMAC; one live code per user (a new one revokes the old).
+  'POST /api/admin/recovery/new': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    if (overLimit(req, res, 'adminRecovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    if (overLimit(req, res, 'adminRecovery', 'user', admin.id)) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    if (u.disabled) return json(res, 400, { error: 'account is disabled — enable it first' });
+    const hours = Math.min(72, Math.max(1, Math.round(+body.hours || RECOVERY_HOURS)));
+    const now = Date.now();
+    for (const r of db.recovery) if (r.userId === u.id && !r.usedAt && !r.revokedAt && r.exp > now) r.revokedAt = new Date(now).toISOString();
+    const code = newRecoveryCode();
+    const rec = {
+      id: crypto.randomBytes(9).toString('base64url'), userId: u.id, hash: hashCode(SECRET, code),
+      created: new Date(now).toISOString(), createdBy: admin.id, exp: now + hours * 3600000
+    };
+    db.recovery.push(rec);
+    authEvent('recovery.issued', { userId: u.id, by: admin.id, recId: rec.id, exp: rec.exp, ip: clientIp(req, TRUST_PROXY_HOPS) });
+    saveDb();
+    json(res, 200, { code, exp: rec.exp, user: { id: u.id, name: u.name } });
+  },
+
+  'POST /api/admin/recovery/revoke': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    if (overLimit(req, res, 'adminRecovery', 'ip', clientIp(req, TRUST_PROXY_HOPS))) return;
+    if (overLimit(req, res, 'adminRecovery', 'user', admin.id)) return;
+    const body = await readBody(req);
+    const now = Date.now();
+    let n = 0;
+    for (const r of db.recovery) if (r.userId === body.id && !r.usedAt && !r.revokedAt && r.exp > now) { r.revokedAt = new Date(now).toISOString(); n++; }
+    if (n) { authEvent('recovery.revoked', { userId: body.id, by: admin.id, ip: clientIp(req, TRUST_PROXY_HOPS) }); saveDb(); }
+    json(res, 200, { ok: true, revoked: n });
+  },
+
   /* ---------- AI Coach ---------- */
   // Routes live in coach/routes.js and are handed the helpers above rather than importing
   // them: they are closures over db and SECRET, and passing them in keeps that module free of
   // a cycle. Every one of them is inert while the feature is unconfigured.
   ...coachRoutes({ json, readBody, readSession, requireAdmin })
 };
+
+// The sign-in screen's routes: the only ones that answer without a session when GUEST_MODE=0.
+const PUBLIC_ROUTES = new Set([
+  'GET /api/health', 'GET /api/config',
+  'POST /api/register/options', 'POST /api/register/verify',
+  'POST /api/login/options', 'POST /api/login/verify', 'POST /api/logout',
+  'POST /api/recovery/options', 'POST /api/recovery/verify'
+]);
 
 /* ---------- Coach: boot recovery, notifications, scheduled reviews ---------- */
 // A job that was running when the process died is not coming back; say so rather than leaving
@@ -587,6 +804,9 @@ http.createServer(async (req, res) => {
   const key = req.method + ' ' + url.pathname;
   const handler = routes[key];
   if (!handler) return json(res, 404, { error: 'not found' });
+  // GUEST_MODE=0: deny by default. Only what the sign-in screen needs answers without a session;
+  // every other route — today's and any added later — is 401 before its handler runs.
+  if (!GUEST_MODE && !PUBLIC_ROUTES.has(key) && !readSession(req)) return json(res, 401, { error: 'not signed in' });
   try { await handler(req, res); }
   catch (e) {
     console.error(key, e);
