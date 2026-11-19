@@ -151,6 +151,9 @@ export function isConnected() {
   const cfg = load();
   if (!isEnabled()) return false;
   if (cfg.provider === 'fixture') return true;
+  // An Anthropic API key from the server environment (pay-per-use, no subscription token)
+  // connects the Claude provider. It never goes through the browser or coach.json.
+  if (cfg.provider === 'claude' && process.env.COACH_ANTHROPIC_API_KEY) return true;
   // Codex's ChatGPT credential remains in Codex's own auth.json cache, not coach.json.
   if (cfg.provider === 'codex') return hasCodexAuth();
   // Claude is intentionally setup-token only. Do not silently retain the old browser OAuth or
@@ -191,6 +194,10 @@ export function jobEnv(jobDir) {
       ? meta.oauthEnv
       : cfg.auth.type === 'apikey' ? meta.apiKeyEnv : null;
     if (name) env[name] = auth.token;
+  }
+  // Server-side Anthropic API key, only when no setup token was stored.
+  if (cfg.provider === 'claude' && process.env.COACH_ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
+    env.ANTHROPIC_API_KEY = process.env.COACH_ANTHROPIC_API_KEY;
   }
   return env;
 }
